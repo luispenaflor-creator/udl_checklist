@@ -1,0 +1,6 @@
+streamlit>=1.32
+pandas>=2.1
+requests>=2.31
+pillow>=10.0
+bcrypt>=4.1
+openpyxl>=3.1
