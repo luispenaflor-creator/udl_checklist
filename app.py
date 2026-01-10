@@ -259,6 +259,92 @@ def fetch_all(client, sql, args=None):
     return res["rows"]
 
 
+def migrate_inspection_items_allow_danado_y_dañado(client):
+    """
+    Si la tabla inspection_items se creó con CHECK viejo (sin 'DAÑADO'),
+    la recrea con CHECK nuevo que acepta:
+      - DAÑADO_REPOSICION / DAÑADO_MANTENIMIENTO
+      - DANADO_REPOSICION / DANADO_MANTENIMIENTO (compat)
+    y conserva datos existentes.
+    """
+    row = fetch_one(
+        client,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='inspection_items'",
+        [],
+    )
+    if not row or not row[0]:
+        return
+
+    ddl = row[0]
+    # Si ya contiene 'DAÑADO', no hacemos nada
+    if "DAÑADO" in ddl:
+        return
+
+    client.execute("PRAGMA foreign_keys = OFF", [])
+    try:
+        client.execute("BEGIN", [])
+
+        client.execute("""
+        CREATE TABLE IF NOT EXISTS inspection_items_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          inspection_id TEXT NOT NULL,
+          asset_type_id INTEGER NOT NULL,
+          status TEXT NOT NULL CHECK (
+            status IN (
+              'OK',
+              'FALTA_REPOSICION',
+              'NO_FUNCIONA_MANTENIMIENTO',
+              'DAÑADO_REPOSICION',
+              'DAÑADO_MANTENIMIENTO',
+              'DANADO_REPOSICION',
+              'DANADO_MANTENIMIENTO',
+              'N_A'
+            )
+          ),
+          condition TEXT NOT NULL CHECK (condition IN ('BUENO','REGULAR','MALO','N_A')),
+          notes TEXT,
+          FOREIGN KEY (inspection_id) REFERENCES inspections(id) ON DELETE CASCADE,
+          FOREIGN KEY (asset_type_id) REFERENCES asset_types(id),
+          UNIQUE (inspection_id, asset_type_id)
+        )
+        """, [])
+
+        client.execute("""
+        INSERT INTO inspection_items_new (id, inspection_id, asset_type_id, status, condition, notes)
+        SELECT
+          id,
+          inspection_id,
+          asset_type_id,
+          CASE
+            WHEN status='DANADO_REPOSICION' THEN 'DAÑADO_REPOSICION'
+            WHEN status='DANADO_MANTENIMIENTO' THEN 'DAÑADO_MANTENIMIENTO'
+            ELSE status
+          END AS status,
+          condition,
+          notes
+        FROM inspection_items
+        """, [])
+
+        client.execute("DROP TABLE inspection_items", [])
+        client.execute("ALTER TABLE inspection_items_new RENAME TO inspection_items", [])
+
+        # recrear índice si tu versión lo usaba
+        client.execute(
+            "CREATE INDEX IF NOT EXISTS idx_items_asset_status ON inspection_items(asset_type_id, status)",
+            [],
+        )
+
+        client.execute("COMMIT", [])
+    except Exception:
+        try:
+            client.execute("ROLLBACK", [])
+        except Exception:
+            pass
+        raise
+    finally:
+        client.execute("PRAGMA foreign_keys = ON", [])
+
+
 # ============================================================
 # SCHEMA + SEED
 # ============================================================
@@ -390,15 +476,38 @@ def settings_set(client, key: str, value: str):
 
 
 def ensure_db_setup(client):
+    # 1) Esquema base
     if not st.session_state.get("_schema_ok", False):
         init_db(client)
         st.session_state["_schema_ok"] = True
 
-    done = settings_get(client, "db_setup_done")
-    if done == "1":
-        return
-    seed_data(client)
-    settings_set(client, "db_setup_done", "1")
+    # 2) Migraciones (DAÑADO / DANADO)
+    migrate_inspection_items_allow_danado_y_dañado(client)
+
+    # 3) SIEMPRE sincronizar catálogos (aunque db_setup_done ya exista)
+    for c in CAMPUSES:
+        client.execute("INSERT OR IGNORE INTO campuses(name) VALUES (?)", [c])
+
+    for name, order in ASSETS:
+        client.execute(
+            "INSERT OR IGNORE INTO asset_types(name, sort_order) VALUES (?, ?)",
+            [name, order],
+        )
+
+    for campus_name, rooms in ROOMS_BY_CAMPUS.items():
+        row = fetch_one(client, "SELECT id FROM campuses WHERE name = ?", [campus_name])
+        if not row:
+            continue
+        campus_id = int(row[0])
+        for room_code in rooms:
+            client.execute(
+                "INSERT OR IGNORE INTO rooms(campus_id, room_code) VALUES (?, ?)",
+                [campus_id, room_code],
+            )
+
+    # 4) Marca setup done (informativo)
+    if settings_get(client, "db_setup_done") != "1":
+        settings_set(client, "db_setup_done", "1")
 
 
 # ============================================================
@@ -559,6 +668,8 @@ boot.success("Conectado ✅")
 boot.empty()
 
 ensure_db_setup(CLIENT)
+cached_assets.clear()
+cached_rooms.clear()
 
 # Admin
 admin_first_run_setup(CLIENT)
