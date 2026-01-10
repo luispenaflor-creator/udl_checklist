@@ -261,11 +261,9 @@ def fetch_all(client, sql, args=None):
 
 def migrate_inspection_items_allow_danado_y_dañado(client):
     """
-    Si la tabla inspection_items se creó con CHECK viejo (sin 'DAÑADO'),
-    la recrea con CHECK nuevo que acepta:
-      - DAÑADO_REPOSICION / DAÑADO_MANTENIMIENTO
-      - DANADO_REPOSICION / DANADO_MANTENIMIENTO (compat)
-    y conserva datos existentes.
+    Repara tablas antiguas que NO aceptan 'DAÑADO_*' por CHECK.
+    Importante: en Turso HTTP pipeline NO podemos usar BEGIN/COMMIT en llamadas separadas.
+    Entonces hacemos migración sin transacción (idempotente y segura).
     """
     row = fetch_one(
         client,
@@ -276,39 +274,44 @@ def migrate_inspection_items_allow_danado_y_dañado(client):
         return
 
     ddl = row[0]
-    # Si ya contiene 'DAÑADO', no hacemos nada
     if "DAÑADO" in ddl:
-        return
+        return  # ya está migrada
 
-    client.execute("PRAGMA foreign_keys = OFF", [])
+    # Evitar FK durante swap
     try:
-        client.execute("BEGIN", [])
+        client.execute("PRAGMA foreign_keys = OFF", [])
+    except Exception:
+        pass
 
-        client.execute("""
-        CREATE TABLE IF NOT EXISTS inspection_items_new (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          inspection_id TEXT NOT NULL,
-          asset_type_id INTEGER NOT NULL,
-          status TEXT NOT NULL CHECK (
-            status IN (
-              'OK',
-              'FALTA_REPOSICION',
-              'NO_FUNCIONA_MANTENIMIENTO',
-              'DAÑADO_REPOSICION',
-              'DAÑADO_MANTENIMIENTO',
-              'DANADO_REPOSICION',
-              'DANADO_MANTENIMIENTO',
-              'N_A'
-            )
-          ),
-          condition TEXT NOT NULL CHECK (condition IN ('BUENO','REGULAR','MALO','N_A')),
-          notes TEXT,
-          FOREIGN KEY (inspection_id) REFERENCES inspections(id) ON DELETE CASCADE,
-          FOREIGN KEY (asset_type_id) REFERENCES asset_types(id),
-          UNIQUE (inspection_id, asset_type_id)
+    # 1) Crear nueva tabla (si no existe)
+    client.execute("""
+    CREATE TABLE IF NOT EXISTS inspection_items_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      inspection_id TEXT NOT NULL,
+      asset_type_id INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK (
+        status IN (
+          'OK',
+          'FALTA_REPOSICION',
+          'NO_FUNCIONA_MANTENIMIENTO',
+          'DAÑADO_REPOSICION',
+          'DAÑADO_MANTENIMIENTO',
+          'DANADO_REPOSICION',
+          'DANADO_MANTENIMIENTO',
+          'N_A'
         )
-        """, [])
+      ),
+      condition TEXT NOT NULL CHECK (condition IN ('BUENO','REGULAR','MALO','N_A')),
+      notes TEXT,
+      FOREIGN KEY (inspection_id) REFERENCES inspections(id) ON DELETE CASCADE,
+      FOREIGN KEY (asset_type_id) REFERENCES asset_types(id),
+      UNIQUE (inspection_id, asset_type_id)
+    )
+    """, [])
 
+    # 2) Copiar SOLO si la nueva está vacía (para que sea idempotente)
+    cnt = fetch_one(client, "SELECT COUNT(*) FROM inspection_items_new", [])
+    if cnt and int(cnt[0]) == 0:
         client.execute("""
         INSERT INTO inspection_items_new (id, inspection_id, asset_type_id, status, condition, notes)
         SELECT
@@ -325,24 +328,33 @@ def migrate_inspection_items_allow_danado_y_dañado(client):
         FROM inspection_items
         """, [])
 
+    # 3) Swap: borrar vieja y renombrar nueva (solo si sigue existiendo la vieja)
+    exists_old = fetch_one(
+        client,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='inspection_items'",
+        [],
+    )
+    exists_new = fetch_one(
+        client,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='inspection_items_new'",
+        [],
+    )
+
+    if exists_old and exists_new:
+        # Ojo: al dropear la tabla vieja se borrarían hijos por FK si foreign_keys=ON, por eso estaba OFF
         client.execute("DROP TABLE inspection_items", [])
         client.execute("ALTER TABLE inspection_items_new RENAME TO inspection_items", [])
 
-        # recrear índice si tu versión lo usaba
-        client.execute(
-            "CREATE INDEX IF NOT EXISTS idx_items_asset_status ON inspection_items(asset_type_id, status)",
-            [],
-        )
+    # 4) Índice
+    client.execute(
+        "CREATE INDEX IF NOT EXISTS idx_items_asset_status ON inspection_items(asset_type_id, status)",
+        [],
+    )
 
-        client.execute("COMMIT", [])
-    except Exception:
-        try:
-            client.execute("ROLLBACK", [])
-        except Exception:
-            pass
-        raise
-    finally:
+    try:
         client.execute("PRAGMA foreign_keys = ON", [])
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -481,10 +493,12 @@ def ensure_db_setup(client):
         init_db(client)
         st.session_state["_schema_ok"] = True
 
-    # 2) Migraciones (DAÑADO / DANADO)
-    migrate_inspection_items_allow_danado_y_dañado(client)
+    # 2) Migración DAÑADO / DANADO (solo una vez)
+    if settings_get(client, "migrated_items_danado") != "1":
+        migrate_inspection_items_allow_danado_y_dañado(client)
+        settings_set(client, "migrated_items_danado", "1")
 
-    # 3) SIEMPRE sincronizar catálogos (aunque db_setup_done ya exista)
+    # 3) SIEMPRE sincronizar catálogos
     for c in CAMPUSES:
         client.execute("INSERT OR IGNORE INTO campuses(name) VALUES (?)", [c])
 
@@ -505,7 +519,7 @@ def ensure_db_setup(client):
                 [campus_id, room_code],
             )
 
-    # 4) Marca setup done (informativo)
+    # 4) Marca setup done
     if settings_get(client, "db_setup_done") != "1":
         settings_set(client, "db_setup_done", "1")
 
@@ -1032,3 +1046,4 @@ if is_admin():
             )
         else:
             st.info("Sin incidencias en ese rango.")
+
