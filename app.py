@@ -604,9 +604,9 @@ with tab_new:
             )
 
 
-                note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
+        note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
 
-                items_payload.append((asset_id, asset_name, status, cond, note))
+        items_payload.append((asset_id, asset_name, status, cond, note))
 
         submitted = st.form_submit_button("Guardar revisión")
 
@@ -861,4 +861,5 @@ if is_admin():
             )
         else:
             st.info("Sin incidencias en ese rango.")
+
 
