@@ -1,7 +1,7 @@
 import os
 import uuid
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
 import streamlit as st
@@ -119,7 +119,7 @@ class TursoHTTPClient:
         args = args or []
         payload = {
             "requests": [
-                {"type": "execute", "stmt": {"sql": sql, "args": [self._arg(a) for a in args]}},
+                {"type": "execute", "stmt": {"sql": sql, "args": [self._arg(a) for a in args]}}},
                 {"type": "close"},
             ]
         }
@@ -421,7 +421,6 @@ def admin_password_hint(client) -> str:
 
 
 def admin_first_run_setup(client):
-    # si no hay usuarios, fuerza crear admin inicial
     if user_count(client) > 0:
         return
 
@@ -460,7 +459,7 @@ def is_logged():
 
 def admin_login_sidebar(client):
     with st.sidebar:
-        st.markdown("## 🔐 Usuarios")
+        st.markdown("## 🔐 Consultas (Login)")
         if st.session_state.get("logged_user"):
             st.success(f"Sesión: {st.session_state['logged_user']}")
             st.caption("Perfil: Administrador" if is_admin() else "Perfil: Usuario")
@@ -558,7 +557,7 @@ def registro_enviado_dialog(resumen: str):
 
 
 # =========================
-# EDITAR / ELIMINAR REVISIONES (para cualquier usuario logueado)
+# EDITAR / ELIMINAR REVISIONES (para usuarios logueados)
 # =========================
 def get_inspection_header(ins_id: str):
     return fetch_one(
@@ -598,7 +597,6 @@ def edit_inspection_dialog(ins_id: str):
     _id, inspected_on, campus_name, room_code, guard_name, inspected_at, comments = hdr
     st.caption(f"{inspected_on} | {campus_name} | {room_code}")
 
-    # Encabezado editable (sin cambiar plantel/salón/fecha para no romper UNIQUE)
     guard_new = st.text_input("Vigilante", value=guard_name or "")
     comments_new = st.text_area("Comentarios generales", value=comments or "")
 
@@ -622,31 +620,29 @@ def edit_inspection_dialog(ins_id: str):
             )
 
             if status_val == "N_A":
-                cond_val = st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=k_cond)
+                st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=k_cond)
                 cond_val = "N_A"
             else:
-                # si cond no está, cae a BUENO por default (pero se muestra editable)
-                default_cond = cond if cond in COND_OPTIONS else "BUENO"
+                default_cond = cond if cond in ["BUENO", "REGULAR", "MALO"] else "BUENO"
                 cond_val = st.selectbox(
                     "Condición",
                     ["BUENO", "REGULAR", "MALO"],
-                    index=["BUENO", "REGULAR", "MALO"].index(default_cond) if default_cond in ["BUENO","REGULAR","MALO"] else 0,
+                    index=["BUENO", "REGULAR", "MALO"].index(default_cond),
                     key=k_cond,
                 )
 
             note_val = st.text_input("Notas", value=note or "", key=k_note)
 
-            # Normaliza (si status N_A => cond N_A)
             if status_val == "N_A":
                 cond_val = "N_A"
 
             edited.append((int(asset_type_id), status_val, cond_val, (note_val or "").strip() or None))
 
+    st.divider()
     c1, c2 = st.columns(2)
 
     with c1:
         if st.button("💾 Guardar cambios", type="primary"):
-            # actualiza encabezado
             CLIENT.execute(
                 "UPDATE inspections SET guard_name=?, comments=?, inspected_at=? WHERE id=?",
                 [
@@ -657,7 +653,6 @@ def edit_inspection_dialog(ins_id: str):
                 ],
             )
 
-            # actualiza items
             for asset_type_id, status_val, cond_val, note_val in edited:
                 CLIENT.execute(
                     """
@@ -701,455 +696,467 @@ migrate_legacy_admin_to_users(CLIENT)
 admin_first_run_setup(CLIENT)
 admin_login_sidebar(CLIENT)
 
-
-# ✅ Tabs según rol
+# ✅ Tabs: Nueva revisión siempre abierta; Consultas solo con sesión
 if is_logged():
     tab_new, tab_query = st.tabs(["📝 Nueva revisión", "🔎 Consultas"])
 else:
-    tab_new, = st.tabs(["📝 Nueva revisión"])
+    (tab_new,) = st.tabs(["📝 Nueva revisión"])
 
 
 # =========================
-# TAB: NUEVA REVISION (solo admin)
+# TAB: NUEVA REVISION (abierto para vigilantes sin cuenta)
 # =========================
-if is_admin():
-    with tab_new:
-        st.subheader("Nueva revisión diaria (1 por salón por día)")
-        st.caption("Fecha automática (CDMX).")
+with tab_new:
+    st.subheader("Nueva revisión diaria (1 por salón por día)")
+    st.caption("✅ Captura abierta para vigilantes sin cuenta. 🔐 Consultas requieren iniciar sesión (CDMX).")
 
-        if st.session_state.get("show_sent_dialog") and st.session_state.get("sent_summary"):
-            registro_enviado_dialog(st.session_state["sent_summary"])
+    if st.session_state.get("show_sent_dialog") and st.session_state.get("sent_summary"):
+        registro_enviado_dialog(st.session_state["sent_summary"])
 
-        campus = st.selectbox("Plantel", ["(Selecciona...)"] + CAMPUSES, index=0, key="campus_selector")
-        if campus != "(Selecciona...)":
-            track_campus_change(campus)
+    campus = st.selectbox("Plantel", ["(Selecciona...)"] + CAMPUSES, index=0, key="campus_selector")
+    if campus != "(Selecciona...)":
+        track_campus_change(campus)
 
-        if campus == "(Selecciona...)":
-            st.info("Selecciona un plantel para iniciar un registro.")
-            st.stop()
+    if campus == "(Selecciona...)":
+        st.info("Selecciona un plantel para iniciar un registro.")
+        st.stop()
 
-        campus_id = cached_campus_id(campus)
-        today_mx = datetime.now(TZ_MX).date()
-        inspected_on_str = today_mx.strftime("%Y-%m-%d")
+    campus_id = cached_campus_id(campus)
+    today_mx = datetime.now(TZ_MX).date()
+    inspected_on_str = today_mx.strftime("%Y-%m-%d")
 
-        nonce = current_nonce()
+    nonce = current_nonce()
 
-        with st.form(f"new_inspection_form_{nonce}", clear_on_submit=False):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.text_input("Fecha (automática)", value=inspected_on_str, disabled=True)
-            with c2:
-                rooms = get_rooms_for_campus(campus_id)
-                room_map = {r[1]: int(r[0]) for r in rooms}
-                options = ["(Selecciona...)"] + list(room_map.keys())
-                choice = st.selectbox("Salón / Área", options, index=0, key=f"room_sel_{nonce}")
-            with c3:
-                guard_name = st.text_input("Nombre del vigilante (obligatorio)", key=f"guard_{nonce}")
+    with st.form(f"new_inspection_form_{nonce}", clear_on_submit=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.text_input("Fecha (automática)", value=inspected_on_str, disabled=True)
+        with c2:
+            rooms = get_rooms_for_campus(campus_id)
+            room_map = {r[1]: int(r[0]) for r in rooms}
+            options = ["(Selecciona...)"] + list(room_map.keys())
+            choice = st.selectbox("Salón / Área", options, index=0, key=f"room_sel_{nonce}")
+        with c3:
+            guard_name = st.text_input("Nombre del vigilante (obligatorio)", key=f"guard_{nonce}")
 
-            room_id = None
-            room_code = None
-            if choice != "(Selecciona...)":
-                room_code = choice
-                room_id = room_map.get(choice)
+        room_id = None
+        room_code = None
+        if choice != "(Selecciona...)":
+            room_code = choice
+            room_id = room_map.get(choice)
 
-            comments = st.text_area("Comentarios generales (opcional)", key=f"comments_{nonce}")
+        comments = st.text_area("Comentarios generales (opcional)", key=f"comments_{nonce}")
 
-            st.markdown("### Checklist de activos")
-            st.caption("Selecciona estatus y condición por cada activo (obligatorio).")
+        st.markdown("### Checklist de activos")
+        st.caption("Selecciona estatus y condición por cada activo (obligatorio).")
 
-            asset_rows = cached_assets()
-            items_payload = []
-            missing = []
+        asset_rows = cached_assets()
+        items_payload = []
+        missing = []
 
-            for asset_id, asset_name in asset_rows:
-                asset_id = int(asset_id)
-                with st.container(border=True):
-                    st.markdown(f"**{asset_name}**")
+        for asset_id, asset_name in asset_rows:
+            asset_id = int(asset_id)
+            with st.container(border=True):
+                st.markdown(f"**{asset_name}**")
 
-                    status_key = f"status_{nonce}_{asset_id}"
-                    cond_key = f"cond_{nonce}_{asset_id}"
+                status_key = f"status_{nonce}_{asset_id}"
+                cond_key = f"cond_{nonce}_{asset_id}"
 
-                    status = st.selectbox(
-                        "Estatus/Acción",
-                        ["(Selecciona...)"] + STATUS_OPTIONS,
-                        index=0,
-                        key=status_key,
-                    )
-
-                    if status == "N_A":
-                        cond = st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=cond_key)
-                    else:
-                        cond = st.selectbox(
-                            "Condición",
-                            ["(Selecciona...)"] + COND_OPTIONS,
-                            index=0,
-                            key=cond_key,
-                        )
-
-                    note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
-                    items_payload.append((asset_id, asset_name, status, cond, note))
-
-            submitted = st.form_submit_button("Guardar revisión")
-
-            if submitted:
-                if not (guard_name or "").strip():
-                    st.error("Falta el nombre del vigilante.")
-                    st.stop()
-
-                if not room_code or room_code == "(Selecciona...)":
-                    st.error("Selecciona un salón/área.")
-                    st.stop()
-
-                # Forzar: si status es N_A => condition queda N_A al guardar
-                items_payload = [
-                    (asset_type_id, asset_name, status, ("N_A" if status == "N_A" else cond), note)
-                    for (asset_type_id, asset_name, status, cond, note) in items_payload
-                ]
-
-                for _, asset_name, status, cond, _ in items_payload:
-                    if status == "(Selecciona...)":
-                        missing.append(asset_name)
-                    elif status != "N_A" and cond == "(Selecciona...)":
-                        missing.append(asset_name)
-
-                if missing:
-                    st.error("Faltan seleccionar estatus/condición en: " + ", ".join(missing))
-                    st.stop()
-
-                if not room_id:
-                    st.error("No se pudo resolver el salón. Intenta de nuevo.")
-                    st.stop()
-
-                inspection_id = str(uuid.uuid4())
-                inspected_at_str = datetime.now(TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
-
-                try:
-                    CLIENT.execute(
-                        """
-                        INSERT INTO inspections(id, campus_id, room_id, guard_name, inspected_on, inspected_at, comments)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        [
-                            inspection_id,
-                            campus_id,
-                            room_id,
-                            guard_name.strip(),
-                            inspected_on_str,
-                            inspected_at_str,
-                            (comments or "").strip() or None,
-                        ],
-                    )
-                except Exception:
-                    st.error(
-                        f"⚠️ Ya existe una revisión para **{campus} / {room_code}** en **{inspected_on_str}**.\n\n"
-                        "No se puede guardar dos veces el mismo salón el mismo día."
-                    )
-                    st.stop()
-
-                for asset_type_id, _, status, cond, note in items_payload:
-                    CLIENT.execute(
-                        """
-                        INSERT INTO inspection_items(inspection_id, asset_type_id, status, condition, notes)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        [
-                            inspection_id,
-                            asset_type_id,
-                            status,
-                            cond,
-                            (note or "").strip() or None,
-                        ],
-                    )
-
-                st.session_state["sent_summary"] = (
-                    f"Plantel: **{campus}**\n\n"
-                    f"Salón/Área: **{room_code}**\n\n"
-                    f"Vigilante: **{guard_name.strip()}**\n\n"
-                    f"Fecha: **{inspected_on_str}**"
+                status = st.selectbox(
+                    "Estatus/Acción",
+                    ["(Selecciona...)"] + STATUS_OPTIONS,
+                    index=0,
+                    key=status_key,
                 )
-                st.session_state["show_sent_dialog"] = True
-                st.rerun()
+
+                # UI: si es N_A, condición N_A bloqueada
+                if status == "N_A":
+                    st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=cond_key)
+                    cond = "N_A"
+                else:
+                    cond = st.selectbox(
+                        "Condición",
+                        ["(Selecciona...)"] + COND_OPTIONS,
+                        index=0,
+                        key=cond_key,
+                    )
+
+                note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
+                items_payload.append((asset_id, asset_name, status, cond, note))
+
+        submitted = st.form_submit_button("Guardar revisión")
+
+        if submitted:
+            if not (guard_name or "").strip():
+                st.error("Falta el nombre del vigilante.")
+                st.stop()
+
+            if not room_code or room_code == "(Selecciona...)":
+                st.error("Selecciona un salón/área.")
+                st.stop()
+
+            # Forzar al guardar: status N_A => condition N_A
+            items_payload = [
+                (asset_type_id, asset_name, status, ("N_A" if status == "N_A" else cond), note)
+                for (asset_type_id, asset_name, status, cond, note) in items_payload
+            ]
+
+            for _, asset_name, status, cond, _ in items_payload:
+                if status == "(Selecciona...)":
+                    missing.append(asset_name)
+                elif status != "N_A" and cond == "(Selecciona...)":
+                    missing.append(asset_name)
+
+            if missing:
+                st.error("Faltan seleccionar estatus/condición en: " + ", ".join(missing))
+                st.stop()
+
+            if not room_id:
+                st.error("No se pudo resolver el salón. Intenta de nuevo.")
+                st.stop()
+
+            inspection_id = str(uuid.uuid4())
+            inspected_at_str = datetime.now(TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
+
+            try:
+                CLIENT.execute(
+                    """
+                    INSERT INTO inspections(id, campus_id, room_id, guard_name, inspected_on, inspected_at, comments)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        inspection_id,
+                        campus_id,
+                        room_id,
+                        guard_name.strip(),
+                        inspected_on_str,
+                        inspected_at_str,
+                        (comments or "").strip() or None,
+                    ],
+                )
+            except Exception:
+                st.error(
+                    f"⚠️ Ya existe una revisión para **{campus} / {room_code}** en **{inspected_on_str}**.\n\n"
+                    "No se puede guardar dos veces el mismo salón el mismo día."
+                )
+                st.stop()
+
+            for asset_type_id, _, status, cond, note in items_payload:
+                CLIENT.execute(
+                    """
+                    INSERT INTO inspection_items(inspection_id, asset_type_id, status, condition, notes)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        inspection_id,
+                        asset_type_id,
+                        status,
+                        cond,
+                        (note or "").strip() or None,
+                    ],
+                )
+
+            st.session_state["sent_summary"] = (
+                f"Plantel: **{campus}**\n\n"
+                f"Salón/Área: **{room_code}**\n\n"
+                f"Vigilante: **{guard_name.strip()}**\n\n"
+                f"Fecha: **{inspected_on_str}**"
+            )
+            st.session_state["show_sent_dialog"] = True
+            st.rerun()
 
 
 # =========================
-# TAB: CONSULTAS (todos los usuarios logueados)
+# TAB: CONSULTAS (solo usuarios logueados)
 # =========================
 if is_logged():
     with tab_query:
         st.subheader("Consultas (dinámicas y visuales)")
-else:
-    # (opcional) si quieres mostrar un aviso dentro de Nueva revisión:
-    pass
 
-    today_mx = datetime.now(TZ_MX).date()
-    preset = st.selectbox(
-        "Rango rápido",
-        ["Este mes", "Últimos 7 días", "Últimos 30 días", "Hoy", "Personalizado"],
-        index=0,
-    )
-
-    if preset == "Hoy":
-        from_d = today_mx
-        to_d = today_mx
-    elif preset == "Últimos 7 días":
-        from_d = today_mx - timedelta(days=6)
-        to_d = today_mx
-    elif preset == "Últimos 30 días":
-        from_d = today_mx - timedelta(days=29)
-        to_d = today_mx
-    elif preset == "Este mes":
-        from_d = today_mx.replace(day=1)
-        to_d = today_mx
-    else:
-        cA, cB = st.columns(2)
-        with cA:
-            from_d = st.date_input("Desde", value=today_mx.replace(day=1), key="q_from")
-        with cB:
-            to_d = st.date_input("Hasta", value=today_mx, key="q_to")
-
-    f1, f2, f3, f4 = st.columns(4)
-    with f1:
-        campus_q = st.selectbox("Plantel", ["(Todos)"] + CAMPUSES, index=0)
-    with f2:
-        guard_q = st.text_input("Filtrar por vigilante (contiene)", value="")
-    with f3:
-        only_incidencias = st.checkbox("Solo incidencias (status ≠ OK/N_A)", value=False)
-    with f4:
-        view_mode = st.selectbox("Vista", ["Resumen", "Detalle por revisión", "Detalle por activo"], index=0)
-
-    room_q = "(Todos)"
-    if campus_q != "(Todos)":
-        campus_id_q = cached_campus_id(campus_q)
-        rooms = get_rooms_for_campus(campus_id_q)
-        room_codes = [r[1] for r in rooms]
-        room_q = st.selectbox("Salón / Área", ["(Todos)"] + room_codes, index=0)
-    else:
-        campus_id_q = None
-
-    where = ["i.inspected_on BETWEEN ? AND ?"]
-    args = [from_d.strftime("%Y-%m-%d"), to_d.strftime("%Y-%m-%d")]
-
-    if campus_id_q is not None:
-        where.append("i.campus_id = ?")
-        args.append(campus_id_q)
-
-    if room_q != "(Todos)" and campus_id_q is not None:
-        where.append("r.room_code = ?")
-        args.append(room_q)
-
-    if guard_q.strip():
-        where.append("LOWER(i.guard_name) LIKE ?")
-        args.append(f"%{guard_q.strip().lower()}%")
-
-    where_sql = " AND ".join(where)
-
-    if view_mode == "Resumen":
-        st.markdown("### Resumen")
-
-        rows = fetch_all(
-            CLIENT,
-            f"""
-            SELECT
-              i.inspected_on AS fecha,
-              c.name AS plantel,
-              COUNT(*) AS revisiones
-            FROM inspections i
-            JOIN campuses c ON c.id = i.campus_id
-            JOIN rooms r ON r.id = i.room_id
-            WHERE {where_sql}
-            GROUP BY i.inspected_on, c.name
-            ORDER BY i.inspected_on DESC, c.name
-            """,
-            args,
-        )
-        df_rev = pd.DataFrame(rows, columns=["Fecha", "Plantel", "Revisiones"]) if rows else pd.DataFrame(
-            columns=["Fecha", "Plantel", "Revisiones"]
+        today_mx = datetime.now(TZ_MX).date()
+        preset = st.selectbox(
+            "Rango rápido",
+            ["Este mes", "Últimos 7 días", "Últimos 30 días", "Hoy", "Personalizado"],
+            index=0,
+            key="preset_q",
         )
 
-        status_where = ""
-        if only_incidencias:
-            status_where = " AND it.status NOT IN ('OK','N_A')"
+        if preset == "Hoy":
+            from_d = today_mx
+            to_d = today_mx
+        elif preset == "Últimos 7 días":
+            from_d = today_mx - timedelta(days=6)
+            to_d = today_mx
+        elif preset == "Últimos 30 días":
+            from_d = today_mx - timedelta(days=29)
+            to_d = today_mx
+        elif preset == "Este mes":
+            from_d = today_mx.replace(day=1)
+            to_d = today_mx
+        else:
+            cA, cB = st.columns(2)
+            with cA:
+                from_d = st.date_input("Desde", value=today_mx.replace(day=1), key="q_from")
+            with cB:
+                to_d = st.date_input("Hasta", value=today_mx, key="q_to")
 
-        rows2 = fetch_all(
-            CLIENT,
-            f"""
-            SELECT
-              it.status AS status,
-              COUNT(*) AS total
-            FROM inspections i
-            JOIN rooms r ON r.id = i.room_id
-            JOIN inspection_items it ON it.inspection_id = i.id
-            WHERE {where_sql}
-              {status_where}
-            GROUP BY it.status
-            ORDER BY total DESC
-            """,
-            args,
-        )
-        df_st = pd.DataFrame(rows2, columns=["Status", "Total"]) if rows2 else pd.DataFrame(columns=["Status", "Total"])
+        f1, f2, f3, f4 = st.columns(4)
+        with f1:
+            campus_q = st.selectbox("Plantel", ["(Todos)"] + CAMPUSES, index=0, key="campus_q")
+        with f2:
+            guard_q = st.text_input("Filtrar por vigilante (contiene)", value="", key="guard_q")
+        with f3:
+            only_incidencias = st.checkbox("Solo incidencias (status ≠ OK/N_A)", value=False, key="only_inc_q")
+        with f4:
+            view_mode = st.selectbox("Vista", ["Resumen", "Detalle por revisión", "Detalle por activo"], index=0, key="view_mode")
 
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            st.metric("Días en rango", (to_d - from_d).days + 1)
-        with m2:
-            st.metric("Revisiones (total)", int(df_rev["Revisiones"].sum()) if not df_rev.empty else 0)
-        with m3:
-            st.metric("Items (total)", int(df_st["Total"].sum()) if not df_st.empty else 0)
+        room_q = "(Todos)"
+        if campus_q != "(Todos)":
+            campus_id_q = cached_campus_id(campus_q)
+            rooms = get_rooms_for_campus(campus_id_q)
+            room_codes = [r[1] for r in rooms]
+            room_q = st.selectbox("Salón / Área", ["(Todos)"] + room_codes, index=0, key="room_q")
+        else:
+            campus_id_q = None
 
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.markdown("#### Revisiones por día/plantel")
-            if df_rev.empty:
+        where = ["i.inspected_on BETWEEN ? AND ?"]
+        args = [from_d.strftime("%Y-%m-%d"), to_d.strftime("%Y-%m-%d")]
+
+        if campus_id_q is not None:
+            where.append("i.campus_id = ?")
+            args.append(campus_id_q)
+
+        if room_q != "(Todos)" and campus_id_q is not None:
+            where.append("r.room_code = ?")
+            args.append(room_q)
+
+        if guard_q.strip():
+            where.append("LOWER(i.guard_name) LIKE ?")
+            args.append(f"%{guard_q.strip().lower()}%")
+
+        where_sql = " AND ".join(where)
+
+        if view_mode == "Resumen":
+            st.markdown("### Resumen")
+
+            rows = fetch_all(
+                CLIENT,
+                f"""
+                SELECT
+                  i.inspected_on AS fecha,
+                  c.name AS plantel,
+                  COUNT(*) AS revisiones
+                FROM inspections i
+                JOIN campuses c ON c.id = i.campus_id
+                JOIN rooms r ON r.id = i.room_id
+                WHERE {where_sql}
+                GROUP BY i.inspected_on, c.name
+                ORDER BY i.inspected_on DESC, c.name
+                """,
+                args,
+            )
+
+            df_rev = pd.DataFrame(rows, columns=["Fecha", "Plantel", "Revisiones"]) if rows else pd.DataFrame(
+                columns=["Fecha", "Plantel", "Revisiones"]
+            )
+
+            # FIX: aseguramos numérico para evitar error pivot_table
+            if not df_rev.empty:
+                df_rev["Revisiones"] = pd.to_numeric(df_rev["Revisiones"], errors="coerce").fillna(0).astype(int)
+
+            status_where = ""
+            if only_incidencias:
+                status_where = " AND it.status NOT IN ('OK','N_A')"
+
+            rows2 = fetch_all(
+                CLIENT,
+                f"""
+                SELECT
+                  it.status AS status,
+                  COUNT(*) AS total
+                FROM inspections i
+                JOIN rooms r ON r.id = i.room_id
+                JOIN inspection_items it ON it.inspection_id = i.id
+                WHERE {where_sql}
+                  {status_where}
+                GROUP BY it.status
+                ORDER BY total DESC
+                """,
+                args,
+            )
+            df_st = pd.DataFrame(rows2, columns=["Status", "Total"]) if rows2 else pd.DataFrame(columns=["Status", "Total"])
+            if not df_st.empty:
+                df_st["Total"] = pd.to_numeric(df_st["Total"], errors="coerce").fillna(0).astype(int)
+
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                st.metric("Días en rango", (to_d - from_d).days + 1)
+            with m2:
+                st.metric("Revisiones (total)", int(df_rev["Revisiones"].sum()) if not df_rev.empty else 0)
+            with m3:
+                st.metric("Items (total)", int(df_st["Total"].sum()) if not df_st.empty else 0)
+
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                st.markdown("#### Revisiones por día/plantel")
+                if df_rev.empty:
+                    st.info("Sin resultados con los filtros actuales.")
+                else:
+                    pivot = df_rev.pivot_table(
+                        index="Fecha",
+                        columns="Plantel",
+                        values="Revisiones",
+                        aggfunc="sum",
+                        fill_value=0,
+                    )
+                    st.dataframe(df_rev, use_container_width=True, hide_index=True)
+                    st.bar_chart(pivot)
+
+            with c2:
+                st.markdown("#### Distribución por estatus")
+                if df_st.empty:
+                    st.info("Sin resultados.")
+                else:
+                    st.dataframe(df_st, use_container_width=True, hide_index=True)
+                    st.bar_chart(df_st.set_index("Status"))
+
+        elif view_mode == "Detalle por revisión":
+            st.markdown("### Detalle por revisión (con editar/eliminar)")
+
+            rows = fetch_all(
+                CLIENT,
+                f"""
+                SELECT
+                  i.inspected_on, c.name, r.room_code, i.guard_name, i.inspected_at, i.comments, i.id
+                FROM inspections i
+                JOIN campuses c ON c.id = i.campus_id
+                JOIN rooms r ON r.id = i.room_id
+                WHERE {where_sql}
+                ORDER BY i.inspected_on DESC, c.name, r.room_code
+                LIMIT 300
+                """,
+                args,
+            )
+
+            st.write(f"Resultados: **{len(rows)}**")
+            if not rows:
                 st.info("Sin resultados con los filtros actuales.")
             else:
-                pivot = df_rev.pivot_table(index="Fecha", columns="Plantel", values="Revisiones", fill_value=0)
-                st.dataframe(df_rev, use_container_width=True, hide_index=True)
-                st.bar_chart(pivot)
+                for inspected_on, campus_name, room_code, guard_name, inspected_at, comments, ins_id in rows[:120]:
+                    with st.expander(f"{inspected_on} | {campus_name} | {room_code} | {guard_name}"):
+                        if inspected_at:
+                            st.caption(f"Registrado: {inspected_at}")
+                        if comments:
+                            st.info(f"Comentarios: {comments}")
 
-        with c2:
-            st.markdown("#### Distribución por estatus")
-            if df_st.empty:
-                st.info("Sin resultados.")
+                        items = fetch_all(
+                            CLIENT,
+                            """
+                            SELECT a.name, it.status, it.condition, it.notes
+                            FROM inspection_items it
+                            JOIN asset_types a ON a.id = it.asset_type_id
+                            WHERE it.inspection_id = ?
+                            ORDER BY a.sort_order, a.name
+                            """,
+                            [ins_id],
+                        )
+
+                        if only_incidencias:
+                            items = [x for x in items if x[1] not in ("OK", "N_A")]
+
+                        for a_name, stt, cond, note in items:
+                            st.write(f"- **{a_name}**: {stt} / {cond}" + (f" — {note}" if note else ""))
+
+                        st.divider()
+                        b1, b2 = st.columns(2)
+                        with b1:
+                            if st.button("✏️ Editar", key=f"btn_edit_{ins_id}"):
+                                edit_inspection_dialog(ins_id)
+                        with b2:
+                            if st.button("🗑️ Eliminar", key=f"btn_del_{ins_id}"):
+                                edit_inspection_dialog(ins_id)
+
+        else:
+            st.markdown("### Detalle por activo (tabla)")
+
+            status_filter = st.multiselect(
+                "Filtrar estatus",
+                options=["(Todos)"] + STATUS_OPTIONS,
+                default=["(Todos)"],
+                key="status_filter",
+            )
+
+            extra_status_sql = ""
+            extra_args = list(args)
+
+            if only_incidencias:
+                extra_status_sql += " AND it.status NOT IN ('OK','N_A')"
+
+            if "(Todos)" not in status_filter:
+                placeholders = ",".join(["?"] * len(status_filter))
+                extra_status_sql += f" AND it.status IN ({placeholders})"
+                extra_args.extend(status_filter)
+
+            rows = fetch_all(
+                CLIENT,
+                f"""
+                SELECT
+                  i.inspected_on AS fecha,
+                  c.name AS plantel,
+                  r.room_code AS salon,
+                  i.guard_name AS vigilante,
+                  a.name AS activo,
+                  it.status AS status_accion,
+                  it.condition AS condicion,
+                  COALESCE(it.notes,'') AS notas,
+                  COALESCE(i.comments,'') AS comentarios,
+                  i.id AS inspection_id
+                FROM inspections i
+                JOIN campuses c ON c.id = i.campus_id
+                JOIN rooms r ON r.id = i.room_id
+                JOIN inspection_items it ON it.inspection_id = i.id
+                JOIN asset_types a ON a.id = it.asset_type_id
+                WHERE {where_sql}
+                  {extra_status_sql}
+                ORDER BY i.inspected_on DESC, c.name, r.room_code, a.sort_order
+                LIMIT 2000
+                """,
+                extra_args,
+            )
+
+            if not rows:
+                st.info("Sin resultados con los filtros actuales.")
             else:
-                st.dataframe(df_st, use_container_width=True, hide_index=True)
-                st.bar_chart(df_st.set_index("Status"))
+                df = pd.DataFrame(
+                    rows,
+                    columns=[
+                        "Fecha", "Plantel", "Salon", "Vigilante", "Activo",
+                        "Status/Accion", "Condicion", "Notas", "Comentarios", "InspectionID"
+                    ],
+                )
 
-    elif view_mode == "Detalle por revisión":
-        st.markdown("### Detalle por revisión (con editar/eliminar)")
+                k1, k2, k3 = st.columns(3)
+                with k1:
+                    st.metric("Items", len(df))
+                with k2:
+                    st.metric("Revisiones únicas", df[["Fecha", "Plantel", "Salon", "InspectionID"]].drop_duplicates().shape[0])
+                with k3:
+                    st.metric("Vigilantes", df["Vigilante"].nunique())
 
-        rows = fetch_all(
-            CLIENT,
-            f"""
-            SELECT
-              i.inspected_on, c.name, r.room_code, i.guard_name, i.inspected_at, i.comments, i.id
-            FROM inspections i
-            JOIN campuses c ON c.id = i.campus_id
-            JOIN rooms r ON r.id = i.room_id
-            WHERE {where_sql}
-            ORDER BY i.inspected_on DESC, c.name, r.room_code
-            LIMIT 300
-            """,
-            args,
-        )
+                st.dataframe(df, use_container_width=True, height=450)
 
-        st.write(f"Resultados: **{len(rows)}**")
-        if not rows:
-            st.info("Sin resultados con los filtros actuales.")
-        else:
-            for inspected_on, campus_name, room_code, guard_name, inspected_at, comments, ins_id in rows[:120]:
-                with st.expander(f"{inspected_on} | {campus_name} | {room_code} | {guard_name}"):
-                    if inspected_at:
-                        st.caption(f"Registrado: {inspected_at}")
-                    if comments:
-                        st.info(f"Comentarios: {comments}")
-
-                    items = fetch_all(
-                        CLIENT,
-                        """
-                        SELECT a.name, it.status, it.condition, it.notes
-                        FROM inspection_items it
-                        JOIN asset_types a ON a.id = it.asset_type_id
-                        WHERE it.inspection_id = ?
-                        ORDER BY a.sort_order, a.name
-                        """,
-                        [ins_id],
-                    )
-
-                    if only_incidencias:
-                        items = [x for x in items if x[1] not in ("OK", "N_A")]
-
-                    for a_name, stt, cond, note in items:
-                        st.write(f"- **{a_name}**: {stt} / {cond}" + (f" — {note}" if note else ""))
-
-                    st.divider()
-                    b1, b2 = st.columns(2)
-                    with b1:
-                        if st.button("✏️ Editar", key=f"btn_edit_{ins_id}"):
-                            edit_inspection_dialog(ins_id)
-                    with b2:
-                        if st.button("🗑️ Eliminar", key=f"btn_del_{ins_id}"):
-                            # reusa el mismo dialog (incluye delete con confirm)
-                            edit_inspection_dialog(ins_id)
-
-    else:
-        st.markdown("### Detalle por activo (tabla)")
-        status_filter = st.multiselect(
-            "Filtrar estatus",
-            options=["(Todos)"] + STATUS_OPTIONS,
-            default=["(Todos)"],
-        )
-
-        extra_status_sql = ""
-        extra_args = list(args)
-
-        if only_incidencias:
-            extra_status_sql += " AND it.status NOT IN ('OK','N_A')"
-
-        if "(Todos)" not in status_filter:
-            placeholders = ",".join(["?"] * len(status_filter))
-            extra_status_sql += f" AND it.status IN ({placeholders})"
-            extra_args.extend(status_filter)
-
-        rows = fetch_all(
-            CLIENT,
-            f"""
-            SELECT
-              i.inspected_on AS fecha,
-              c.name AS plantel,
-              r.room_code AS salon,
-              i.guard_name AS vigilante,
-              a.name AS activo,
-              it.status AS status_accion,
-              it.condition AS condicion,
-              COALESCE(it.notes,'') AS notas,
-              COALESCE(i.comments,'') AS comentarios,
-              i.id AS inspection_id
-            FROM inspections i
-            JOIN campuses c ON c.id = i.campus_id
-            JOIN rooms r ON r.id = i.room_id
-            JOIN inspection_items it ON it.inspection_id = i.id
-            JOIN asset_types a ON a.id = it.asset_type_id
-            WHERE {where_sql}
-              {extra_status_sql}
-            ORDER BY i.inspected_on DESC, c.name, r.room_code, a.sort_order
-            LIMIT 2000
-            """,
-            extra_args,
-        )
-
-        if not rows:
-            st.info("Sin resultados con los filtros actuales.")
-        else:
-            df = pd.DataFrame(
-                rows,
-                columns=[
-                    "Fecha", "Plantel", "Salon", "Vigilante", "Activo",
-                    "Status/Accion", "Condicion", "Notas", "Comentarios", "InspectionID"
-                ],
-            )
-
-            k1, k2, k3 = st.columns(3)
-            with k1:
-                st.metric("Items", len(df))
-            with k2:
-                st.metric("Revisiones únicas", df[["Fecha", "Plantel", "Salon", "InspectionID"]].drop_duplicates().shape[0])
-            with k3:
-                st.metric("Vigilantes", df["Vigilante"].nunique())
-
-            st.dataframe(df, use_container_width=True, height=450)
-
-            st.download_button(
-                "⬇️ Descargar CSV (detalle por activo)",
-                data=df.drop(columns=["InspectionID"]).to_csv(index=False).encode("utf-8"),
-                file_name=f"detalle_activos_{from_d.strftime('%Y%m%d')}_{to_d.strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-            )
+                st.download_button(
+                    "⬇️ Descargar CSV (detalle por activo)",
+                    data=df.drop(columns=["InspectionID"]).to_csv(index=False).encode("utf-8"),
+                    file_name=f"detalle_activos_{from_d.strftime('%Y%m%d')}_{to_d.strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                )
 
 
 # =========================
-# ADMIN PANEL (SOLO ADMIN: gestión de usuarios)
+# ADMIN PANEL (solo admin, dentro de consultas/login)
 # =========================
-if is_admin():
+if is_logged() and is_admin():
     st.divider()
     st.header("🛠️ Panel Admin (Usuarios)")
 
@@ -1216,5 +1223,3 @@ if is_admin():
             user_delete(CLIENT, picked_id2)
             st.success("✅ Usuario eliminado.")
             st.rerun()
-
-
