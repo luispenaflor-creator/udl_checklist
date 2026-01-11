@@ -507,6 +507,15 @@ admin_login_sidebar(CLIENT)
 
 tab_new, tab_query = st.tabs(["📝 Nueva revisión", "🔎 Consultas"])
 
+def on_status_change(status_key: str, cond_key: str):
+    """Si Estatus es N_A => Condición se fuerza a N_A. Si deja de ser N_A, se resetea si estaba en N_A."""
+    stt = st.session_state.get(status_key)
+    if stt == "N_A":
+        st.session_state[cond_key] = "N_A"
+    else:
+        # Si venía de N_A, obligamos a elegir de nuevo
+        if st.session_state.get(cond_key) == "N_A":
+            st.session_state[cond_key] = "(Selecciona...)"
 
 # =========================
 # TAB: NUEVA REVISION
@@ -570,23 +579,30 @@ with tab_new:
             with st.container(border=True):
                 st.markdown(f"**{asset_name}**")
 
+                status_key = f"status_{nonce}_{asset_id}"
+                cond_key   = f"cond_{nonce}_{asset_id}"
+
                 status = st.selectbox(
                     "Estatus/Acción",
                     ["(Selecciona...)"] + STATUS_OPTIONS,
                     index=0,
-                    key=f"status_{nonce}_{asset_id}",
+                    key=status_key,
+                    on_change=on_status_change,
+                    args=(status_key, cond_key),
                 )
 
-                if status == "N_A":
-                    cond = "N_A"
-                    st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=f"cond_{nonce}_{asset_id}")
-                else:
-                    cond = st.selectbox(
-                        "Condición",
-                        ["(Selecciona...)"] + COND_OPTIONS,
-                        index=0,
-                        key=f"cond_{nonce}_{asset_id}",
-                    )
+# Fuerza el valor en session_state cuando está en N_A
+        if st.session_state.get(status_key) == "N_A":
+            st.session_state[cond_key] = "N_A"
+            cond = st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=cond_key)
+        else:
+            cond = st.selectbox(
+                "Condición",
+                ["(Selecciona...)"] + COND_OPTIONS,
+                index=0,
+                key=cond_key,
+            )
+
 
                 note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
 
@@ -845,3 +861,4 @@ if is_admin():
             )
         else:
             st.info("Sin incidencias en ese rango.")
+
