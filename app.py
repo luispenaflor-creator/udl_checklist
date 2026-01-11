@@ -121,7 +121,7 @@ class TursoHTTPClient:
         args = args or []
         payload = {
             "requests": [
-                {"type": "execute", "stmt": {"sql": sql, "args": [self._arg(a) for a in args]}}},
+                {"type": "execute", "stmt": {"sql": sql, "args": [self._arg(a) for a in args]}},
                 {"type": "close"},
             ]
         }
@@ -842,3 +842,4 @@ if is_admin():
             )
         else:
             st.info("Sin incidencias en ese rango.")
+
