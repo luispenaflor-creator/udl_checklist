@@ -1,9 +1,7 @@
-# app.py (SIN FOTOS) - versión estable (Turso) - CORREGIDO
-
 import os
 import uuid
 import time
-from datetime import datetime, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import streamlit as st
@@ -15,7 +13,7 @@ import requests
 # =========================
 # CONFIG
 # =========================
-st.set_page_config(page_title="Checklist UDL", layout="wide")
+st.set_page_config(page_title="Checklist diario equipo HyFlex - UDLondres", layout="wide")
 TZ_MX = ZoneInfo("America/Mexico_City")
 
 CAMPUSES = [
@@ -121,7 +119,7 @@ class TursoHTTPClient:
         args = args or []
         payload = {
             "requests": [
-                {"type": "execute", "stmt": {"sql": sql, "args": [self._arg(a) for a in args]}},
+                {"type": "execute", "stmt": {"sql": sql, "args": [self._arg(a) for a in args]}}},
                 {"type": "close"},
             ]
         }
@@ -280,9 +278,20 @@ def init_db(client):
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- usuarios (multi-admin)
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL UNIQUE,
+      pass_hash TEXT NOT NULL,
+      is_admin INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_inspections_room_date ON inspections(room_id, inspected_on);
     CREATE INDEX IF NOT EXISTS idx_inspections_campus_date ON inspections(campus_id, inspected_on);
     CREATE INDEX IF NOT EXISTS idx_items_asset_status ON inspection_items(asset_type_id, status);
+    CREATE INDEX IF NOT EXISTS idx_users_admin ON users(is_admin);
     """
     exec_many(client, schema)
 
@@ -330,29 +339,90 @@ def ensure_db_setup(client):
 
 
 # =========================
-# ADMIN (bcrypt + pista)
+# USERS (multi-admin) + MIGRACIÓN desde app_settings
 # =========================
-def admin_is_configured(client) -> bool:
-    return (settings_get(client, "admin_user") is not None) and (settings_get(client, "admin_pass_hash") is not None)
+def user_count(client) -> int:
+    row = fetch_one(client, "SELECT COUNT(*) FROM users", [])
+    return int(row[0]) if row else 0
 
 
-def admin_password_hint(client) -> str:
-    return settings_get(client, "admin_hint") or ""
+def user_get_by_username(client, username: str):
+    return fetch_one(client, "SELECT id, username, pass_hash, is_admin FROM users WHERE username = ?", [username])
 
 
-def admin_check_login(client, user: str, password: str) -> bool:
-    stored_user = settings_get(client, "admin_user")
-    stored_hash = settings_get(client, "admin_pass_hash")
-    if not stored_user or not stored_hash or user != stored_user:
+def user_create(client, username: str, password: str, is_admin: bool):
+    username = (username or "").strip()
+    if not username:
+        raise ValueError("Usuario vacío.")
+    if not password or len(password) < 6:
+        raise ValueError("Contraseña mínima 6 caracteres.")
+    salt = bcrypt.gensalt(rounds=12)
+    pw_hash = bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
+    client.execute(
+        "INSERT INTO users(username, pass_hash, is_admin, updated_at) VALUES(?, ?, ?, datetime('now'))",
+        [username, pw_hash, 1 if is_admin else 0],
+    )
+
+
+def user_set_admin(client, user_id: int, is_admin: bool):
+    client.execute(
+        "UPDATE users SET is_admin = ?, updated_at=datetime('now') WHERE id = ?",
+        [1 if is_admin else 0, int(user_id)],
+    )
+
+
+def user_check_login(client, username: str, password: str) -> bool:
+    row = user_get_by_username(client, (username or "").strip())
+    if not row:
         return False
+    _, _, stored_hash, _ = row
     try:
         return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
     except Exception:
         return False
 
 
+def user_is_admin(client, username: str) -> bool:
+    row = user_get_by_username(client, (username or "").strip())
+    if not row:
+        return False
+    return int(row[3]) == 1
+
+
+def users_list(client):
+    return fetch_all(client, "SELECT id, username, is_admin, created_at FROM users ORDER BY is_admin DESC, username", [])
+
+
+def user_delete(client, user_id: int):
+    client.execute("DELETE FROM users WHERE id = ?", [int(user_id)])
+
+
+def migrate_legacy_admin_to_users(client):
+    if settings_get(client, "users_migrated_v1") == "1":
+        return
+
+    if user_count(client) > 0:
+        settings_set(client, "users_migrated_v1", "1")
+        return
+
+    legacy_user = settings_get(client, "admin_user")
+    legacy_hash = settings_get(client, "admin_pass_hash")
+
+    if legacy_user and legacy_hash:
+        client.execute(
+            "INSERT OR IGNORE INTO users(username, pass_hash, is_admin, updated_at) VALUES(?, ?, 1, datetime('now'))",
+            [legacy_user.strip(), legacy_hash],
+        )
+        settings_set(client, "users_migrated_v1", "1")
+
+
+def admin_password_hint(client) -> str:
+    return settings_get(client, "admin_hint") or ""
+
+
 def admin_first_run_setup(client):
-    if admin_is_configured(client):
+    # si no hay usuarios, fuerza crear admin inicial
+    if user_count(client) > 0:
         return
 
     st.warning("🔧 Configuración inicial: crea el usuario/contraseña ADMIN (solo 1 vez).")
@@ -372,13 +442,8 @@ def admin_first_run_setup(client):
             st.error("Las contraseñas no coinciden.")
             st.stop()
 
-        salt = bcrypt.gensalt(rounds=12)
-        pw_hash = bcrypt.hashpw(pw1.encode("utf-8"), salt).decode("utf-8")
-
-        settings_set(client, "admin_user", user.strip())
-        settings_set(client, "admin_pass_hash", pw_hash)
+        user_create(client, user.strip(), pw1, is_admin=True)
         settings_set(client, "admin_hint", (hint or "").strip())
-
         st.success("Admin configurado. Ahora inicia sesión desde la barra lateral.")
         st.rerun()
 
@@ -389,24 +454,33 @@ def is_admin():
     return st.session_state.get("is_admin", False)
 
 
+def is_logged():
+    return bool(st.session_state.get("logged_user"))
+
+
 def admin_login_sidebar(client):
     with st.sidebar:
-        st.markdown("## 🔐 Admin")
-        if is_admin():
-            st.success("Sesión admin activa")
+        st.markdown("## 🔐 Usuarios")
+        if st.session_state.get("logged_user"):
+            st.success(f"Sesión: {st.session_state['logged_user']}")
+            st.caption("Perfil: Administrador" if is_admin() else "Perfil: Usuario")
             if st.button("Cerrar sesión"):
+                st.session_state["logged_user"] = None
                 st.session_state["is_admin"] = False
+                st.rerun()
         else:
-            user_default = settings_get(client, "admin_user") or "admin"
-            user = st.text_input("Usuario", value=user_default)
-            pw = st.text_input("Contraseña", type="password")
             hint = admin_password_hint(client)
+            user = st.text_input("Usuario", value="")
+            pw = st.text_input("Contraseña", type="password")
             if hint:
                 st.caption(f"Indicio: {hint}")
+
             if st.button("Entrar"):
-                if admin_check_login(client, user.strip(), pw):
-                    st.session_state["is_admin"] = True
-                    st.success("Bienvenido, admin.")
+                if user_check_login(client, user.strip(), pw):
+                    st.session_state["logged_user"] = user.strip()
+                    st.session_state["is_admin"] = user_is_admin(client, user.strip())
+                    st.success("Sesión iniciada.")
+                    st.rerun()
                 else:
                     st.error("Usuario o contraseña incorrectos.")
 
@@ -422,7 +496,6 @@ def cached_campus_id(campus_name: str):
 
 @st.cache_data(ttl=900)
 def cached_assets():
-    # Dedup por si quedaron duplicados en DB
     return fetch_all(
         CLIENT,
         """
@@ -485,9 +558,132 @@ def registro_enviado_dialog(resumen: str):
 
 
 # =========================
+# EDITAR / ELIMINAR REVISIONES (para cualquier usuario logueado)
+# =========================
+def get_inspection_header(ins_id: str):
+    return fetch_one(
+        CLIENT,
+        """
+        SELECT i.id, i.inspected_on, c.name, r.room_code, i.guard_name, i.inspected_at, i.comments
+        FROM inspections i
+        JOIN campuses c ON c.id = i.campus_id
+        JOIN rooms r ON r.id = i.room_id
+        WHERE i.id = ?
+        """,
+        [ins_id],
+    )
+
+
+def get_inspection_items(ins_id: str):
+    return fetch_all(
+        CLIENT,
+        """
+        SELECT a.id as asset_type_id, a.name, it.status, it.condition, COALESCE(it.notes,'')
+        FROM inspection_items it
+        JOIN asset_types a ON a.id = it.asset_type_id
+        WHERE it.inspection_id = ?
+        ORDER BY a.sort_order, a.name
+        """,
+        [ins_id],
+    )
+
+
+@st.dialog("✏️ Editar revisión")
+def edit_inspection_dialog(ins_id: str):
+    hdr = get_inspection_header(ins_id)
+    if not hdr:
+        st.error("No encontré la revisión.")
+        return
+
+    _id, inspected_on, campus_name, room_code, guard_name, inspected_at, comments = hdr
+    st.caption(f"{inspected_on} | {campus_name} | {room_code}")
+
+    # Encabezado editable (sin cambiar plantel/salón/fecha para no romper UNIQUE)
+    guard_new = st.text_input("Vigilante", value=guard_name or "")
+    comments_new = st.text_area("Comentarios generales", value=comments or "")
+
+    st.markdown("### Items")
+    items = get_inspection_items(ins_id)
+
+    edited = []
+    for asset_type_id, asset_name, stt, cond, note in items:
+        with st.container(border=True):
+            st.markdown(f"**{asset_name}**")
+
+            k_status = f"edit_st_{ins_id}_{asset_type_id}"
+            k_cond = f"edit_cd_{ins_id}_{asset_type_id}"
+            k_note = f"edit_nt_{ins_id}_{asset_type_id}"
+
+            status_val = st.selectbox(
+                "Estatus/Acción",
+                STATUS_OPTIONS,
+                index=STATUS_OPTIONS.index(stt) if stt in STATUS_OPTIONS else 0,
+                key=k_status,
+            )
+
+            if status_val == "N_A":
+                cond_val = st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=k_cond)
+                cond_val = "N_A"
+            else:
+                # si cond no está, cae a BUENO por default (pero se muestra editable)
+                default_cond = cond if cond in COND_OPTIONS else "BUENO"
+                cond_val = st.selectbox(
+                    "Condición",
+                    ["BUENO", "REGULAR", "MALO"],
+                    index=["BUENO", "REGULAR", "MALO"].index(default_cond) if default_cond in ["BUENO","REGULAR","MALO"] else 0,
+                    key=k_cond,
+                )
+
+            note_val = st.text_input("Notas", value=note or "", key=k_note)
+
+            # Normaliza (si status N_A => cond N_A)
+            if status_val == "N_A":
+                cond_val = "N_A"
+
+            edited.append((int(asset_type_id), status_val, cond_val, (note_val or "").strip() or None))
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button("💾 Guardar cambios", type="primary"):
+            # actualiza encabezado
+            CLIENT.execute(
+                "UPDATE inspections SET guard_name=?, comments=?, inspected_at=? WHERE id=?",
+                [
+                    (guard_new or "").strip() or guard_name,
+                    (comments_new or "").strip() or None,
+                    datetime.now(TZ_MX).strftime("%Y-%m-%d %H:%M:%S"),
+                    ins_id,
+                ],
+            )
+
+            # actualiza items
+            for asset_type_id, status_val, cond_val, note_val in edited:
+                CLIENT.execute(
+                    """
+                    UPDATE inspection_items
+                    SET status=?, condition=?, notes=?
+                    WHERE inspection_id=? AND asset_type_id=?
+                    """,
+                    [status_val, cond_val, note_val, ins_id, asset_type_id],
+                )
+
+            st.success("✅ Cambios guardados.")
+            st.rerun()
+
+    with c2:
+        st.warning("⚠️ Eliminar borra la revisión completa.")
+        confirm = st.checkbox("Confirmo eliminar definitivamente", value=False, key=f"del_ok_{ins_id}")
+        if st.button("🗑️ Eliminar revisión", disabled=not confirm):
+            CLIENT.execute("DELETE FROM inspections WHERE id = ?", [ins_id])
+            st.success("✅ Revisión eliminada.")
+            st.rerun()
+
+
+# =========================
 # APP START
 # =========================
-st.title("Checklist diario de activos - UDL (SIN FOTOS)")
+st.title("Checklist diario equipo HyFlex - UDLondres")
 
 boot = st.empty()
 boot.info("Conectando a Turso…")
@@ -501,306 +697,400 @@ with st.spinner("Conectando…"):
 boot.empty()
 
 ensure_db_setup(CLIENT)
+migrate_legacy_admin_to_users(CLIENT)
 admin_first_run_setup(CLIENT)
 admin_login_sidebar(CLIENT)
 
-tab_new, tab_query = st.tabs(["📝 Nueva revisión", "🔎 Consultas"])
+# ✅ OBLIGAR LOGIN para usar la app
+if not is_logged():
+    st.info("Inicia sesión para acceder a Consultas.")
+    st.stop()
+
+# ✅ Tabs según rol
+if is_admin():
+    tab_new, tab_query = st.tabs(["📝 Nueva revisión", "🔎 Consultas"])
+else:
+    tab_query, = st.tabs(["🔎 Consultas"])
 
 
 # =========================
-# TAB: NUEVA REVISION
+# TAB: NUEVA REVISION (solo admin)
 # =========================
-with tab_new:
-    st.subheader("Nueva revisión diaria (1 por salón por día)")
-    st.caption("Fecha automática (CDMX).")
+if is_admin():
+    with tab_new:
+        st.subheader("Nueva revisión diaria (1 por salón por día)")
+        st.caption("Fecha automática (CDMX).")
 
-    if st.session_state.get("show_sent_dialog") and st.session_state.get("sent_summary"):
-        registro_enviado_dialog(st.session_state["sent_summary"])
+        if st.session_state.get("show_sent_dialog") and st.session_state.get("sent_summary"):
+            registro_enviado_dialog(st.session_state["sent_summary"])
 
-    campus = st.selectbox("Plantel", ["(Selecciona...)"] + CAMPUSES, index=0, key="campus_selector")
-    if campus != "(Selecciona...)":
-        track_campus_change(campus)
+        campus = st.selectbox("Plantel", ["(Selecciona...)"] + CAMPUSES, index=0, key="campus_selector")
+        if campus != "(Selecciona...)":
+            track_campus_change(campus)
 
-    if campus == "(Selecciona...)":
-        st.info("Selecciona un plantel para iniciar un registro.")
-        st.stop()
+        if campus == "(Selecciona...)":
+            st.info("Selecciona un plantel para iniciar un registro.")
+            st.stop()
 
-    campus_id = cached_campus_id(campus)
-    today_mx = datetime.now(TZ_MX).date()
-    inspected_on_str = today_mx.strftime("%Y-%m-%d")
+        campus_id = cached_campus_id(campus)
+        today_mx = datetime.now(TZ_MX).date()
+        inspected_on_str = today_mx.strftime("%Y-%m-%d")
 
-    nonce = current_nonce()
+        nonce = current_nonce()
 
-    with st.form(f"new_inspection_form_{nonce}", clear_on_submit=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.text_input("Fecha (automática)", value=inspected_on_str, disabled=True)
-        with c2:
-            rooms = get_rooms_for_campus(campus_id)
-            room_map = {r[1]: int(r[0]) for r in rooms}
-            options = ["(Selecciona...)"] + list(room_map.keys())
-            choice = st.selectbox("Salón / Área", options, index=0, key=f"room_sel_{nonce}")
-        with c3:
-            guard_name = st.text_input("Nombre del vigilante (obligatorio)", key=f"guard_{nonce}")
+        with st.form(f"new_inspection_form_{nonce}", clear_on_submit=False):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.text_input("Fecha (automática)", value=inspected_on_str, disabled=True)
+            with c2:
+                rooms = get_rooms_for_campus(campus_id)
+                room_map = {r[1]: int(r[0]) for r in rooms}
+                options = ["(Selecciona...)"] + list(room_map.keys())
+                choice = st.selectbox("Salón / Área", options, index=0, key=f"room_sel_{nonce}")
+            with c3:
+                guard_name = st.text_input("Nombre del vigilante (obligatorio)", key=f"guard_{nonce}")
 
-        room_id = None
-        room_code = None
-        if choice != "(Selecciona...)":
-            room_code = choice
-            room_id = room_map.get(choice)
+            room_id = None
+            room_code = None
+            if choice != "(Selecciona...)":
+                room_code = choice
+                room_id = room_map.get(choice)
 
-        comments = st.text_area("Comentarios generales (opcional)", key=f"comments_{nonce}")
+            comments = st.text_area("Comentarios generales (opcional)", key=f"comments_{nonce}")
 
-        st.markdown("### Checklist de activos")
-        st.caption("Selecciona estatus y condición por cada activo (obligatorio).")
+            st.markdown("### Checklist de activos")
+            st.caption("Selecciona estatus y condición por cada activo (obligatorio).")
 
-        asset_rows = cached_assets()
-        items_payload = []
-        missing = []
+            asset_rows = cached_assets()
+            items_payload = []
+            missing = []
 
-        for asset_id, asset_name in asset_rows:
-            asset_id = int(asset_id)
-            with st.container(border=True):
-                st.markdown(f"**{asset_name}**")
+            for asset_id, asset_name in asset_rows:
+                asset_id = int(asset_id)
+                with st.container(border=True):
+                    st.markdown(f"**{asset_name}**")
 
-                status_key = f"status_{nonce}_{asset_id}"
-                cond_key = f"cond_{nonce}_{asset_id}"
+                    status_key = f"status_{nonce}_{asset_id}"
+                    cond_key = f"cond_{nonce}_{asset_id}"
 
-                status = st.selectbox(
-                    "Estatus/Acción",
-                    ["(Selecciona...)"] + STATUS_OPTIONS,
-                    index=0,
-                    key=status_key,
-                )
-
-                # UI: Si es N_A, la condición se muestra fija y bloqueada
-                if status == "N_A":
-                    cond = st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=cond_key)
-                else:
-                    cond = st.selectbox(
-                        "Condición",
-                        ["(Selecciona...)"] + COND_OPTIONS,
+                    status = st.selectbox(
+                        "Estatus/Acción",
+                        ["(Selecciona...)"] + STATUS_OPTIONS,
                         index=0,
-                        key=cond_key,
+                        key=status_key,
                     )
 
-                note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
+                    if status == "N_A":
+                        cond = st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=cond_key)
+                    else:
+                        cond = st.selectbox(
+                            "Condición",
+                            ["(Selecciona...)"] + COND_OPTIONS,
+                            index=0,
+                            key=cond_key,
+                        )
 
-                items_payload.append((asset_id, asset_name, status, cond, note))
+                    note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
+                    items_payload.append((asset_id, asset_name, status, cond, note))
 
-        submitted = st.form_submit_button("Guardar revisión")
+            submitted = st.form_submit_button("Guardar revisión")
 
-        if submitted:
-            if not (guard_name or "").strip():
-                st.error("Falta el nombre del vigilante.")
-                st.stop()
+            if submitted:
+                if not (guard_name or "").strip():
+                    st.error("Falta el nombre del vigilante.")
+                    st.stop()
 
-            if not room_code or room_code == "(Selecciona...)":
-                st.error("Selecciona un salón/área.")
-                st.stop()
+                if not room_code or room_code == "(Selecciona...)":
+                    st.error("Selecciona un salón/área.")
+                    st.stop()
 
-            # ✅ FORZAR: si status es N_A => condition queda N_A al guardar
-            items_payload = [
-                (asset_type_id, asset_name, status, ("N_A" if status == "N_A" else cond), note)
-                for (asset_type_id, asset_name, status, cond, note) in items_payload
-            ]
+                # Forzar: si status es N_A => condition queda N_A al guardar
+                items_payload = [
+                    (asset_type_id, asset_name, status, ("N_A" if status == "N_A" else cond), note)
+                    for (asset_type_id, asset_name, status, cond, note) in items_payload
+                ]
 
-            # Validación: condición obligatoria solo si status != N_A
-            for _, asset_name, status, cond, _ in items_payload:
-                if status == "(Selecciona...)":
-                    missing.append(asset_name)
-                elif status != "N_A" and cond == "(Selecciona...)":
-                    missing.append(asset_name)
+                for _, asset_name, status, cond, _ in items_payload:
+                    if status == "(Selecciona...)":
+                        missing.append(asset_name)
+                    elif status != "N_A" and cond == "(Selecciona...)":
+                        missing.append(asset_name)
 
-            if missing:
-                st.error("Faltan seleccionar estatus/condición en: " + ", ".join(missing))
-                st.stop()
+                if missing:
+                    st.error("Faltan seleccionar estatus/condición en: " + ", ".join(missing))
+                    st.stop()
 
-            if not room_id:
-                st.error("No se pudo resolver el salón. Intenta de nuevo.")
-                st.stop()
+                if not room_id:
+                    st.error("No se pudo resolver el salón. Intenta de nuevo.")
+                    st.stop()
 
-            inspection_id = str(uuid.uuid4())
+                inspection_id = str(uuid.uuid4())
+                inspected_at_str = datetime.now(TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
 
-            # ✅ Calcular hora EXACTA al guardar
-            inspected_at_str = datetime.now(TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    CLIENT.execute(
+                        """
+                        INSERT INTO inspections(id, campus_id, room_id, guard_name, inspected_on, inspected_at, comments)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            inspection_id,
+                            campus_id,
+                            room_id,
+                            guard_name.strip(),
+                            inspected_on_str,
+                            inspected_at_str,
+                            (comments or "").strip() or None,
+                        ],
+                    )
+                except Exception:
+                    st.error(
+                        f"⚠️ Ya existe una revisión para **{campus} / {room_code}** en **{inspected_on_str}**.\n\n"
+                        "No se puede guardar dos veces el mismo salón el mismo día."
+                    )
+                    st.stop()
 
-            # Insert inspección (bloquea duplicados)
-            try:
-                CLIENT.execute(
-                    """
-                    INSERT INTO inspections(id, campus_id, room_id, guard_name, inspected_on, inspected_at, comments)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        inspection_id,
-                        campus_id,
-                        room_id,
-                        guard_name.strip(),
-                        inspected_on_str,
-                        inspected_at_str,
-                        (comments or "").strip() or None,
-                    ],
+                for asset_type_id, _, status, cond, note in items_payload:
+                    CLIENT.execute(
+                        """
+                        INSERT INTO inspection_items(inspection_id, asset_type_id, status, condition, notes)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        [
+                            inspection_id,
+                            asset_type_id,
+                            status,
+                            cond,
+                            (note or "").strip() or None,
+                        ],
+                    )
+
+                st.session_state["sent_summary"] = (
+                    f"Plantel: **{campus}**\n\n"
+                    f"Salón/Área: **{room_code}**\n\n"
+                    f"Vigilante: **{guard_name.strip()}**\n\n"
+                    f"Fecha: **{inspected_on_str}**"
                 )
-            except Exception:
-                st.error(
-                    f"⚠️ Ya existe una revisión para **{campus} / {room_code}** en **{inspected_on_str}**.\n\n"
-                    "No se puede guardar dos veces el mismo salón el mismo día."
-                )
-                st.stop()
-
-            # Insert items
-            for asset_type_id, _, status, cond, note in items_payload:
-                CLIENT.execute(
-                    """
-                    INSERT INTO inspection_items(inspection_id, asset_type_id, status, condition, notes)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    [
-                        inspection_id,
-                        asset_type_id,
-                        status,
-                        cond,
-                        (note or "").strip() or None,
-                    ],
-                )
-
-            st.session_state["sent_summary"] = (
-                f"Plantel: **{campus}**\n\n"
-                f"Salón/Área: **{room_code}**\n\n"
-                f"Vigilante: **{guard_name.strip()}**\n\n"
-                f"Fecha: **{inspected_on_str}**"
-            )
-            st.session_state["show_sent_dialog"] = True
-            st.rerun()
+                st.session_state["show_sent_dialog"] = True
+                st.rerun()
 
 
 # =========================
-# TAB: CONSULTAS
+# TAB: CONSULTAS (todos los usuarios logueados)
 # =========================
 with tab_query:
-    st.subheader("Consultar revisiones (lectura)")
+    st.subheader("Consultas (dinámicas y visuales)")
 
-    q1, q2, q3 = st.columns(3)
-    with q1:
-        campus_q = st.selectbox("Plantel", ["(Todos)"] + CAMPUSES, index=0, key="campus_q")
-    with q2:
-        today_mx_q = datetime.now(TZ_MX).date()
-        from_d = st.date_input("Desde", value=today_mx_q.replace(day=1), key="from_d")
-    with q3:
-        today_mx_q2 = datetime.now(TZ_MX).date()
-        to_d = st.date_input("Hasta", value=today_mx_q2, key="to_d")
+    today_mx = datetime.now(TZ_MX).date()
+    preset = st.selectbox(
+        "Rango rápido",
+        ["Este mes", "Últimos 7 días", "Últimos 30 días", "Hoy", "Personalizado"],
+        index=0,
+    )
 
-    where = []
-    args = []
+    if preset == "Hoy":
+        from_d = today_mx
+        to_d = today_mx
+    elif preset == "Últimos 7 días":
+        from_d = today_mx - timedelta(days=6)
+        to_d = today_mx
+    elif preset == "Últimos 30 días":
+        from_d = today_mx - timedelta(days=29)
+        to_d = today_mx
+    elif preset == "Este mes":
+        from_d = today_mx.replace(day=1)
+        to_d = today_mx
+    else:
+        cA, cB = st.columns(2)
+        with cA:
+            from_d = st.date_input("Desde", value=today_mx.replace(day=1), key="q_from")
+        with cB:
+            to_d = st.date_input("Hasta", value=today_mx, key="q_to")
 
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        campus_q = st.selectbox("Plantel", ["(Todos)"] + CAMPUSES, index=0)
+    with f2:
+        guard_q = st.text_input("Filtrar por vigilante (contiene)", value="")
+    with f3:
+        only_incidencias = st.checkbox("Solo incidencias (status ≠ OK/N_A)", value=False)
+    with f4:
+        view_mode = st.selectbox("Vista", ["Resumen", "Detalle por revisión", "Detalle por activo"], index=0)
+
+    room_q = "(Todos)"
     if campus_q != "(Todos)":
         campus_id_q = cached_campus_id(campus_q)
+        rooms = get_rooms_for_campus(campus_id_q)
+        room_codes = [r[1] for r in rooms]
+        room_q = st.selectbox("Salón / Área", ["(Todos)"] + room_codes, index=0)
+    else:
+        campus_id_q = None
+
+    where = ["i.inspected_on BETWEEN ? AND ?"]
+    args = [from_d.strftime("%Y-%m-%d"), to_d.strftime("%Y-%m-%d")]
+
+    if campus_id_q is not None:
         where.append("i.campus_id = ?")
         args.append(campus_id_q)
 
-    where.append("i.inspected_on BETWEEN ? AND ?")
-    args.extend([from_d.strftime("%Y-%m-%d"), to_d.strftime("%Y-%m-%d")])
+    if room_q != "(Todos)" and campus_id_q is not None:
+        where.append("r.room_code = ?")
+        args.append(room_q)
 
-    sql = f"""
-    SELECT i.inspected_on, c.name, r.room_code, i.guard_name, i.comments, i.id
-    FROM inspections i
-    JOIN campuses c ON c.id = i.campus_id
-    JOIN rooms r ON r.id = i.room_id
-    WHERE {" AND ".join(where)}
-    ORDER BY i.inspected_on DESC, c.name, r.room_code
-    LIMIT 300
-    """
-    rows = fetch_all(CLIENT, sql, args)
-    st.write(f"Resultados: **{len(rows)}**")
+    if guard_q.strip():
+        where.append("LOWER(i.guard_name) LIKE ?")
+        args.append(f"%{guard_q.strip().lower()}%")
 
-    for inspected_on, campus_name, room_code, guard_name, comments, ins_id in rows[:80]:
-        with st.expander(f"{inspected_on} | {campus_name} | {room_code} | {guard_name}"):
-            items = fetch_all(
-                CLIENT,
-                """
-                SELECT a.name, it.status, it.condition, it.notes
-                FROM inspection_items it
-                JOIN asset_types a ON a.id = it.asset_type_id
-                WHERE it.inspection_id = ?
-                ORDER BY a.sort_order, a.name
-                """,
-                [ins_id],
-            )
+    where_sql = " AND ".join(where)
 
-            for a_name, stt, cond, note in items:
-                st.write(f"- **{a_name}**: {stt} / {cond}" + (f" — {note}" if note else ""))
+    if view_mode == "Resumen":
+        st.markdown("### Resumen")
 
-            if comments:
-                st.info(f"Comentarios: {comments}")
-
-
-# =========================
-# ADMIN PANEL
-# =========================
-if is_admin():
-    st.divider()
-    st.header("🛠️ Panel Admin")
-
-    t1, t2 = st.tabs(["🗑️ Eliminar revisión", "📊 Reportes & Excel"])
-
-    with t1:
-        st.subheader("Eliminar una revisión completa (incluye sus items)")
-
-        e1, e2 = st.columns(2)
-        with e1:
-            campus_e = st.selectbox("Plantel", CAMPUSES, key="campus_e")
-        with e2:
-            today_mx_e = datetime.now(TZ_MX).date()
-            day_e = st.date_input("Fecha (día)", value=today_mx_e, key="day_e")
-
-        campus_id_e = cached_campus_id(campus_e)
-        ins_list = fetch_all(
+        rows = fetch_all(
             CLIENT,
-            """
-            SELECT i.id, r.room_code, i.guard_name, i.inspected_at
+            f"""
+            SELECT
+              i.inspected_on AS fecha,
+              c.name AS plantel,
+              COUNT(*) AS revisiones
             FROM inspections i
+            JOIN campuses c ON c.id = i.campus_id
             JOIN rooms r ON r.id = i.room_id
-            WHERE i.campus_id = ? AND i.inspected_on = ?
-            ORDER BY r.room_code
+            WHERE {where_sql}
+            GROUP BY i.inspected_on, c.name
+            ORDER BY i.inspected_on DESC, c.name
             """,
-            [campus_id_e, day_e.strftime("%Y-%m-%d")],
+            args,
+        )
+        df_rev = pd.DataFrame(rows, columns=["Fecha", "Plantel", "Revisiones"]) if rows else pd.DataFrame(
+            columns=["Fecha", "Plantel", "Revisiones"]
         )
 
-        if not ins_list:
-            st.info("No hay revisiones para ese plantel y día.")
+        status_where = ""
+        if only_incidencias:
+            status_where = " AND it.status NOT IN ('OK','N_A')"
+
+        rows2 = fetch_all(
+            CLIENT,
+            f"""
+            SELECT
+              it.status AS status,
+              COUNT(*) AS total
+            FROM inspections i
+            JOIN rooms r ON r.id = i.room_id
+            JOIN inspection_items it ON it.inspection_id = i.id
+            WHERE {where_sql}
+              {status_where}
+            GROUP BY it.status
+            ORDER BY total DESC
+            """,
+            args,
+        )
+        df_st = pd.DataFrame(rows2, columns=["Status", "Total"]) if rows2 else pd.DataFrame(columns=["Status", "Total"])
+
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("Días en rango", (to_d - from_d).days + 1)
+        with m2:
+            st.metric("Revisiones (total)", int(df_rev["Revisiones"].sum()) if not df_rev.empty else 0)
+        with m3:
+            st.metric("Items (total)", int(df_st["Total"].sum()) if not df_st.empty else 0)
+
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            st.markdown("#### Revisiones por día/plantel")
+            if df_rev.empty:
+                st.info("Sin resultados con los filtros actuales.")
+            else:
+                pivot = df_rev.pivot_table(index="Fecha", columns="Plantel", values="Revisiones", fill_value=0)
+                st.dataframe(df_rev, use_container_width=True, hide_index=True)
+                st.bar_chart(pivot)
+
+        with c2:
+            st.markdown("#### Distribución por estatus")
+            if df_st.empty:
+                st.info("Sin resultados.")
+            else:
+                st.dataframe(df_st, use_container_width=True, hide_index=True)
+                st.bar_chart(df_st.set_index("Status"))
+
+    elif view_mode == "Detalle por revisión":
+        st.markdown("### Detalle por revisión (con editar/eliminar)")
+
+        rows = fetch_all(
+            CLIENT,
+            f"""
+            SELECT
+              i.inspected_on, c.name, r.room_code, i.guard_name, i.inspected_at, i.comments, i.id
+            FROM inspections i
+            JOIN campuses c ON c.id = i.campus_id
+            JOIN rooms r ON r.id = i.room_id
+            WHERE {where_sql}
+            ORDER BY i.inspected_on DESC, c.name, r.room_code
+            LIMIT 300
+            """,
+            args,
+        )
+
+        st.write(f"Resultados: **{len(rows)}**")
+        if not rows:
+            st.info("Sin resultados con los filtros actuales.")
         else:
-            options = [f"{room} | {guard} | {ts or ''} | {ins_id}" for ins_id, room, guard, ts in ins_list]
-            pick = st.selectbox("Selecciona una revisión", options, key="pick_ins")
-            picked_id = pick.split("|")[-1].strip()
+            for inspected_on, campus_name, room_code, guard_name, inspected_at, comments, ins_id in rows[:120]:
+                with st.expander(f"{inspected_on} | {campus_name} | {room_code} | {guard_name}"):
+                    if inspected_at:
+                        st.caption(f"Registrado: {inspected_at}")
+                    if comments:
+                        st.info(f"Comentarios: {comments}")
 
-            st.warning("⚠️ Esto borra TODO. No se puede deshacer.")
-            confirm = st.checkbox("Confirmo que quiero eliminarla definitivamente", key="confirm_delete")
-            if st.button("Eliminar revisión", type="primary", disabled=not confirm):
-                CLIENT.execute("DELETE FROM inspections WHERE id = ?", [picked_id])
-                st.success("✅ Revisión eliminada.")
+                    items = fetch_all(
+                        CLIENT,
+                        """
+                        SELECT a.name, it.status, it.condition, it.notes
+                        FROM inspection_items it
+                        JOIN asset_types a ON a.id = it.asset_type_id
+                        WHERE it.inspection_id = ?
+                        ORDER BY a.sort_order, a.name
+                        """,
+                        [ins_id],
+                    )
 
-    with t2:
-        st.subheader("Incidencias (status ≠ OK / N_A) y exportación a Excel")
+                    if only_incidencias:
+                        items = [x for x in items if x[1] not in ("OK", "N_A")]
 
-        r1, r2, r3 = st.columns(3)
-        with r1:
-            campus_r = st.selectbox("Plantel", ["(Todos)"] + CAMPUSES, key="campus_r")
-        with r2:
-            today_mx_r = datetime.now(TZ_MX).date()
-            from_r = st.date_input("Desde", value=today_mx_r.replace(day=1), key="from_r")
-        with r3:
-            today_mx_r2 = datetime.now(TZ_MX).date()
-            to_r = st.date_input("Hasta", value=today_mx_r2, key="to_r")
+                    for a_name, stt, cond, note in items:
+                        st.write(f"- **{a_name}**: {stt} / {cond}" + (f" — {note}" if note else ""))
 
-        args = [from_r.strftime("%Y-%m-%d"), to_r.strftime("%Y-%m-%d")]
-        campus_filter_sql = ""
-        if campus_r != "(Todos)":
-            campus_id_r = cached_campus_id(campus_r)
-            campus_filter_sql = "AND i.campus_id = ?"
-            args.append(campus_id_r)
+                    st.divider()
+                    b1, b2 = st.columns(2)
+                    with b1:
+                        if st.button("✏️ Editar", key=f"btn_edit_{ins_id}"):
+                            edit_inspection_dialog(ins_id)
+                    with b2:
+                        if st.button("🗑️ Eliminar", key=f"btn_del_{ins_id}"):
+                            # reusa el mismo dialog (incluye delete con confirm)
+                            edit_inspection_dialog(ins_id)
 
-        inc = fetch_all(
+    else:
+        st.markdown("### Detalle por activo (tabla)")
+        status_filter = st.multiselect(
+            "Filtrar estatus",
+            options=["(Todos)"] + STATUS_OPTIONS,
+            default=["(Todos)"],
+        )
+
+        extra_status_sql = ""
+        extra_args = list(args)
+
+        if only_incidencias:
+            extra_status_sql += " AND it.status NOT IN ('OK','N_A')"
+
+        if "(Todos)" not in status_filter:
+            placeholders = ",".join(["?"] * len(status_filter))
+            extra_status_sql += f" AND it.status IN ({placeholders})"
+            extra_args.extend(status_filter)
+
+        rows = fetch_all(
             CLIENT,
             f"""
             SELECT
@@ -811,35 +1101,118 @@ if is_admin():
               a.name AS activo,
               it.status AS status_accion,
               it.condition AS condicion,
-              it.notes AS notas
+              COALESCE(it.notes,'') AS notas,
+              COALESCE(i.comments,'') AS comentarios,
+              i.id AS inspection_id
             FROM inspections i
             JOIN campuses c ON c.id = i.campus_id
             JOIN rooms r ON r.id = i.room_id
             JOIN inspection_items it ON it.inspection_id = i.id
             JOIN asset_types a ON a.id = it.asset_type_id
-            WHERE i.inspected_on BETWEEN ? AND ?
-              {campus_filter_sql}
-              AND it.status NOT IN ('OK','N_A')
+            WHERE {where_sql}
+              {extra_status_sql}
             ORDER BY i.inspected_on DESC, c.name, r.room_code, a.sort_order
+            LIMIT 2000
             """,
-            args,
+            extra_args,
         )
 
-        st.write(f"Total incidencias: **{len(inc)}**")
-        if inc:
+        if not rows:
+            st.info("Sin resultados con los filtros actuales.")
+        else:
             df = pd.DataFrame(
-                inc,
-                columns=["Fecha", "Plantel", "Salon", "Vigilante", "Activo", "Status/Accion", "Condicion", "Notas"],
+                rows,
+                columns=[
+                    "Fecha", "Plantel", "Salon", "Vigilante", "Activo",
+                    "Status/Accion", "Condicion", "Notas", "Comentarios", "InspectionID"
+                ],
             )
-            st.dataframe(df, use_container_width=True, height=350)
 
-            buf = df.to_csv(index=False).encode("utf-8")
+            k1, k2, k3 = st.columns(3)
+            with k1:
+                st.metric("Items", len(df))
+            with k2:
+                st.metric("Revisiones únicas", df[["Fecha", "Plantel", "Salon", "InspectionID"]].drop_duplicates().shape[0])
+            with k3:
+                st.metric("Vigilantes", df["Vigilante"].nunique())
+
+            st.dataframe(df, use_container_width=True, height=450)
+
             st.download_button(
-                "⬇️ Descargar CSV (Incidencias)",
-                data=buf,
-                file_name=f"incidencias_{from_r.strftime('%Y%m%d')}_{to_r.strftime('%Y%m%d')}.csv",
+                "⬇️ Descargar CSV (detalle por activo)",
+                data=df.drop(columns=["InspectionID"]).to_csv(index=False).encode("utf-8"),
+                file_name=f"detalle_activos_{from_d.strftime('%Y%m%d')}_{to_d.strftime('%Y%m%d')}.csv",
                 mime="text/csv",
             )
-        else:
-            st.info("Sin incidencias en ese rango.")
 
+
+# =========================
+# ADMIN PANEL (SOLO ADMIN: gestión de usuarios)
+# =========================
+if is_admin():
+    st.divider()
+    st.header("🛠️ Panel Admin (Usuarios)")
+
+    st.markdown("#### Crear nuevo usuario")
+    u1, u2 = st.columns(2)
+    with u1:
+        new_user = st.text_input("Usuario", key="new_user")
+        new_is_admin = st.checkbox("¿Es administrador?", value=False, key="new_is_admin")
+    with u2:
+        pw1 = st.text_input("Contraseña", type="password", key="new_pw1")
+        pw2 = st.text_input("Confirmar contraseña", type="password", key="new_pw2")
+
+    if st.button("Crear usuario", type="primary"):
+        try:
+            if pw1 != pw2:
+                st.error("Las contraseñas no coinciden.")
+            else:
+                user_create(CLIENT, new_user.strip(), pw1, is_admin=new_is_admin)
+                st.success("✅ Usuario creado.")
+                st.rerun()
+        except Exception as e:
+            st.error(f"No se pudo crear el usuario: {e}")
+
+    st.divider()
+    st.markdown("#### Lista de usuarios")
+    users = users_list(CLIENT)
+    dfu = pd.DataFrame(users, columns=["ID", "Usuario", "Admin", "Creado"]) if users else pd.DataFrame(
+        columns=["ID", "Usuario", "Admin", "Creado"]
+    )
+    if not dfu.empty:
+        dfu["Admin"] = dfu["Admin"].apply(lambda x: "Sí" if int(x) == 1 else "No")
+        st.dataframe(dfu, use_container_width=True, hide_index=True)
+    else:
+        st.info("No hay usuarios.")
+
+    st.markdown("#### Cambiar rol (Admin/Usuario)")
+    current_user = st.session_state.get("logged_user") or ""
+    candidates = [(uid, uname, adm) for uid, uname, adm, _ in users if uname != current_user]
+    if candidates:
+        pick = st.selectbox(
+            "Selecciona usuario",
+            [f"{uname} (Admin: {'Sí' if int(adm)==1 else 'No'}) | ID {uid}" for uid, uname, adm in candidates],
+            key="pick_role_user",
+        )
+        picked_id = int(pick.split("ID")[-1].strip())
+        desired = st.checkbox("Marcar como ADMIN", value=False, key="set_admin_chk")
+        if st.button("Guardar rol"):
+            user_set_admin(CLIENT, picked_id, desired)
+            st.success("✅ Rol actualizado.")
+            st.rerun()
+    else:
+        st.info("No puedes cambiar tu propio rol desde aquí.")
+
+    st.markdown("#### Eliminar usuario")
+    if candidates:
+        pick2 = st.selectbox(
+            "Selecciona usuario",
+            [f"{uname} (Admin: {'Sí' if int(adm)==1 else 'No'}) | ID {uid}" for uid, uname, adm in candidates],
+            key="pick_del_user",
+        )
+        picked_id2 = int(pick2.split("ID")[-1].strip())
+        confirm = st.checkbox("Confirmo eliminar este usuario definitivamente", value=False, key="confirm_del_user")
+        if st.button("Eliminar usuario", disabled=not confirm):
+            user_delete(CLIENT, picked_id2)
+            st.success("✅ Usuario eliminado.")
+            st.rerun()
