@@ -396,6 +396,28 @@ def user_delete(client, user_id: int):
     client.execute("DELETE FROM users WHERE id = ?", [int(user_id)])
 
 
+def user_update_password(client, username: str, new_password: str):
+    if not new_password or len(new_password) < 6:
+        raise ValueError("La contraseña debe tener al menos 6 caracteres.")
+    salt = bcrypt.gensalt(rounds=12)
+    pw_hash = bcrypt.hashpw(new_password.encode("utf-8"), salt).decode("utf-8")
+    client.execute(
+        "UPDATE users SET pass_hash=?, updated_at=datetime('now') WHERE username=?",
+        [pw_hash, username.strip()],
+    )
+
+
+def user_update_password_by_id(client, user_id: int, new_password: str):
+    if not new_password or len(new_password) < 6:
+        raise ValueError("La contraseña debe tener al menos 6 caracteres.")
+    salt = bcrypt.gensalt(rounds=12)
+    pw_hash = bcrypt.hashpw(new_password.encode("utf-8"), salt).decode("utf-8")
+    client.execute(
+        "UPDATE users SET pass_hash=?, updated_at=datetime('now') WHERE id=?",
+        [pw_hash, int(user_id)],
+    )
+
+
 def migrate_legacy_admin_to_users(client):
     if settings_get(client, "users_migrated_v1") == "1":
         return
@@ -542,7 +564,6 @@ def track_campus_change(campus_value: str):
     prev = st.session_state.get("campus_prev")
     if prev != campus_value:
         st.session_state["campus_prev"] = campus_value
-        # limpiar selección de salón y nuevo salón al cambiar plantel
         st.session_state["room_choice"] = "(Selecciona...)"
         st.session_state["new_room_code"] = ""
         new_form_nonce()
@@ -705,9 +726,9 @@ migrate_legacy_admin_to_users(CLIENT)
 admin_first_run_setup(CLIENT)
 admin_login_sidebar(CLIENT)
 
-# Tabs: Nueva revisión siempre; Consultas solo con login
+# Tabs: Nueva revisión siempre; Consultas y Gestión solo con login
 if is_logged():
-    tab_new, tab_query = st.tabs(["📝 Nueva revisión", "🔎 Consultas"])
+    tab_new, tab_query, tab_users = st.tabs(["📝 Nueva revisión", "🔎 Consultas", "👥 Usuarios"])
 else:
     (tab_new,) = st.tabs(["📝 Nueva revisión"])
 
@@ -717,7 +738,7 @@ else:
 # =========================
 with tab_new:
     st.subheader("Nueva revisión diaria (1 por salón por día)")
-    st.caption("✅ Captura abierta para vigilantes sin cuenta. 🔐 Consultas requieren iniciar sesión (CDMX).")
+    st.caption("✅ Captura abierta para vigilantes sin cuenta. 🔐 Consultas y Usuarios requieren iniciar sesión (CDMX).")
 
     if st.session_state.get("show_sent_dialog") and st.session_state.get("sent_summary"):
         registro_enviado_dialog(st.session_state["sent_summary"])
@@ -726,7 +747,6 @@ with tab_new:
     if campus != "(Selecciona...)":
         track_campus_change(campus)
 
-    # IMPORTANTE: NO st.stop() aquí (para no bloquear Consultas)
     if campus == "(Selecciona...)":
         st.info("Selecciona un plantel para iniciar un registro.")
     else:
@@ -734,7 +754,6 @@ with tab_new:
         today_mx = datetime.now(TZ_MX).date()
         inspected_on_str = today_mx.strftime("%Y-%m-%d")
 
-        # ✅ Selector de salón FUERA del form (para que el input de "nuevo salón" aparezca al instante)
         rooms = get_rooms_for_campus(campus_id)
         room_map = {r[1]: int(r[0]) for r in rooms}
         room_options = ["(Selecciona...)"] + list(room_map.keys()) + ["(Agregar nuevo...)"]
@@ -751,7 +770,11 @@ with tab_new:
         room_code = None
 
         if choice == "(Agregar nuevo...)":
-            new_room = st.text_input("Escribe el salón/área nuevo", key="new_room_code", placeholder="Ej. Salon 01 / Laboratorio / Auditorio")
+            new_room = st.text_input(
+                "Escribe el salón/área nuevo",
+                key="new_room_code",
+                placeholder="Ej. Salon 01 / Laboratorio / Auditorio",
+            )
             new_room = " ".join((new_room or "").strip().split())
             if new_room:
                 room_code = new_room
@@ -763,7 +786,6 @@ with tab_new:
 
         nonce = current_nonce()
 
-        # ✅ El checklist y el submit quedan en FORM (esto sí debe ir en form)
         with st.form(f"new_inspection_form_{nonce}", clear_on_submit=False):
             st.markdown("### Checklist de activos")
             st.caption("Selecciona estatus y condición por cada activo (obligatorio).")
@@ -812,7 +834,6 @@ with tab_new:
                 st.error("Selecciona un salón/área o agrega uno nuevo.")
                 st.stop()
 
-            # NA => Condición NA
             items_payload = [
                 (asset_type_id, asset_name, status, ("N_A" if status == "N_A" else cond), note)
                 for (asset_type_id, asset_name, status, cond, note) in items_payload
@@ -828,7 +849,6 @@ with tab_new:
                 st.error("Faltan seleccionar estatus/condición en: " + ", ".join(missing))
                 st.stop()
 
-            # Crear salón si es nuevo (esto ahora sí funciona para Medellín y cualquiera)
             if choice == "(Agregar nuevo...)":
                 CLIENT.execute(
                     "INSERT OR IGNORE INTO rooms(campus_id, room_code) VALUES (?, ?)",
@@ -949,7 +969,6 @@ if is_logged():
             room_codes = [r[1] for r in rooms]
             room_q = st.selectbox("Salón / Área", ["(Todos)"] + room_codes, index=0, key="room_q")
 
-        # filtro de activo
         asset_rows = cached_assets()
         asset_names = [r[1] for r in asset_rows]
         activo_q = st.multiselect(
@@ -1090,7 +1109,6 @@ if is_logged():
                             [ins_id],
                         )
 
-                        # filtros
                         if "(Todos)" not in activo_q:
                             items = [x for x in items if x[0] in activo_q]
                         if only_incidencias:
@@ -1102,7 +1120,6 @@ if is_logged():
                             for a_name, stt, cond, note in items:
                                 st.write(f"- **{a_name}**: {stt} / {cond}" + (f" — {note}" if note else ""))
 
-                        # ✅ Botones confiables (por session_state)
                         b1, b2 = st.columns(2)
                         with b1:
                             if st.button("✏️ Editar", key=f"btn_edit_{ins_id}"):
@@ -1115,7 +1132,6 @@ if is_logged():
                                 st.session_state["open_edit_dialog"] = True
                                 st.rerun()
 
-                # abrir dialog al final (fuera del loop)
                 if st.session_state.get("open_edit_dialog") and st.session_state.get("edit_target"):
                     edit_inspection_dialog(st.session_state["edit_target"])
 
@@ -1193,72 +1209,167 @@ if is_logged():
 
 
 # =========================
-# ADMIN PANEL (solo admin)
+# TAB: USUARIOS (solo login)
 # =========================
-if is_logged() and is_admin():
-    st.divider()
-    st.header("🛠️ Panel Admin (Usuarios)")
+if is_logged():
+    with tab_users:
+        st.subheader("👤 Mi cuenta")
+        st.caption("Aquí puedes cambiar tu contraseña. (Mínimo 6 caracteres)")
 
-    st.markdown("#### Crear nuevo usuario")
-    u1, u2 = st.columns(2)
-    with u1:
-        new_user = st.text_input("Usuario", key="new_user")
-        new_is_admin = st.checkbox("¿Es administrador?", value=False, key="new_is_admin")
-    with u2:
-        pw1 = st.text_input("Contraseña", type="password", key="new_pw1")
-        pw2 = st.text_input("Confirmar contraseña", type="password", key="new_pw2")
+        current_user = st.session_state.get("logged_user") or ""
+        st.text_input("Usuario", value=current_user, disabled=True)
 
-    if st.button("Crear usuario", type="primary"):
-        try:
-            if pw1 != pw2:
-                st.error("Las contraseñas no coinciden.")
+        pw_old = st.text_input("Contraseña actual", type="password", key="pw_old")
+        pw_new1 = st.text_input("Nueva contraseña", type="password", key="pw_new1")
+        pw_new2 = st.text_input("Confirmar nueva contraseña", type="password", key="pw_new2")
+
+        if st.button("Actualizar contraseña", type="primary", key="btn_change_pw"):
+            if not pw_old:
+                st.error("Escribe tu contraseña actual.")
+            elif not user_check_login(CLIENT, current_user, pw_old):
+                st.error("Contraseña actual incorrecta.")
+            elif pw_new1 != pw_new2:
+                st.error("La nueva contraseña no coincide en ambos campos.")
             else:
-                user_create(CLIENT, new_user.strip(), pw1, is_admin=new_is_admin)
-                st.success("✅ Usuario creado.")
-                st.rerun()
-        except Exception as e:
-            st.error(f"No se pudo crear el usuario: {e}")
+                try:
+                    user_update_password(CLIENT, current_user, pw_new1)
+                    st.success("✅ Contraseña actualizada.")
+                    st.session_state["pw_old"] = ""
+                    st.session_state["pw_new1"] = ""
+                    st.session_state["pw_new2"] = ""
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo actualizar: {e}")
 
-    st.divider()
-    st.markdown("#### Lista de usuarios")
-    users = users_list(CLIENT)
-    dfu = pd.DataFrame(users, columns=["ID", "Usuario", "Admin", "Creado"]) if users else pd.DataFrame(
-        columns=["ID", "Usuario", "Admin", "Creado"]
-    )
-    if not dfu.empty:
-        dfu["Admin"] = dfu["Admin"].apply(lambda x: "Sí" if int(x) == 1 else "No")
-        st.dataframe(dfu, use_container_width=True, hide_index=True)
-    else:
-        st.info("No hay usuarios.")
+        st.divider()
+        st.subheader("👥 Gestión de usuarios")
+        if not is_admin():
+            st.info("Solo el administrador puede gestionar usuarios.")
+        else:
+            sub1, sub2, sub3 = st.tabs(["➕ Crear", "🧰 Administrar", "🔁 Reset contraseña"])
 
-    st.markdown("#### Cambiar rol (Admin/Usuario)")
-    current_user = st.session_state.get("logged_user") or ""
-    candidates = [(uid, uname, adm) for uid, uname, adm, _ in users if uname != current_user]
-    if candidates:
-        pick = st.selectbox(
-            "Selecciona usuario",
-            [f"{uname} (Admin: {'Sí' if int(adm)==1 else 'No'}) | ID {uid}" for uid, uname, adm in candidates],
-            key="pick_role_user",
-        )
-        picked_id = int(pick.split("ID")[-1].strip())
-        desired = st.checkbox("Marcar como ADMIN", value=False, key="set_admin_chk")
-        if st.button("Guardar rol"):
-            user_set_admin(CLIENT, picked_id, desired)
-            st.success("✅ Rol actualizado.")
-            st.rerun()
-    else:
-        st.info("No puedes cambiar tu propio rol desde aquí.")
+            with sub1:
+                st.markdown("### Crear nuevo usuario")
+                u1, u2 = st.columns(2)
+                with u1:
+                    new_user = st.text_input("Usuario", key="new_user")
+                    new_is_admin = st.checkbox("¿Es administrador?", value=False, key="new_is_admin")
+                with u2:
+                    p1 = st.text_input("Contraseña", type="password", key="new_pw1")
+                    p2 = st.text_input("Confirmar contraseña", type="password", key="new_pw2")
 
-    st.markdown("#### Eliminar usuario")
-    if candidates:
-        pick2 = st.selectbox(
-            "Selecciona usuario",
-            [f"{uname} (Admin: {'Sí' if int(adm)==1 else 'No'}) | ID {uid}" for uid, uname, adm in candidates],
-            key="pick_del_user",
-        )
-        picked_id2 = int(pick2.split("ID")[-1].strip())
-        confirm = st.checkbox("Confirmo eliminar este usuario definitivamente", value=False, key="confirm_del_user")
-        if st.button("Eliminar usuario", disabled=not confirm):
-            user_delete(CLIENT, picked_id2)
-            st.success("✅ Usuario eliminado.")
-            st.rerun()
+                if st.button("Crear usuario", type="primary", key="btn_create_user"):
+                    try:
+                        if p1 != p2:
+                            st.error("Las contraseñas no coinciden.")
+                        else:
+                            user_create(CLIENT, new_user.strip(), p1, is_admin=new_is_admin)
+                            st.success("✅ Usuario creado.")
+                            st.session_state["new_user"] = ""
+                            st.session_state["new_is_admin"] = False
+                            st.session_state["new_pw1"] = ""
+                            st.session_state["new_pw2"] = ""
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"No se pudo crear el usuario: {e}")
+
+            with sub2:
+                st.markdown("### Lista de usuarios")
+                users = users_list(CLIENT)
+                dfu = (
+                    pd.DataFrame(users, columns=["ID", "Usuario", "Admin", "Creado"])
+                    if users
+                    else pd.DataFrame(columns=["ID", "Usuario", "Admin", "Creado"])
+                )
+                if not dfu.empty:
+                    dfu["Admin"] = dfu["Admin"].apply(lambda x: "Sí" if int(x) == 1 else "No")
+                    st.dataframe(dfu, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No hay usuarios.")
+
+                st.divider()
+                st.markdown("### Cambiar rol (Admin/Usuario)")
+                current_user = st.session_state.get("logged_user") or ""
+                candidates = [(uid, uname, adm) for uid, uname, adm, _ in users if uname != current_user]
+
+                if candidates:
+                    pick = st.selectbox(
+                        "Selecciona usuario",
+                        [f"{uname} (Admin: {'Sí' if int(adm)==1 else 'No'}) | ID {uid}" for uid, uname, adm in candidates],
+                        key="pick_role_user",
+                    )
+                    picked_id = int(pick.split("ID")[-1].strip())
+
+                    current_admin_state = None
+                    for uid, uname, adm in candidates:
+                        if uid == picked_id:
+                            current_admin_state = int(adm)
+                            break
+
+                    desired = st.checkbox(
+                        "Marcar como ADMIN",
+                        value=True if current_admin_state == 1 else False,
+                        key="set_admin_chk",
+                    )
+
+                    if st.button("Guardar rol", key="btn_save_role"):
+                        user_set_admin(CLIENT, picked_id, desired)
+                        st.success("✅ Rol actualizado.")
+                        st.rerun()
+                else:
+                    st.info("No puedes cambiar tu propio rol desde aquí.")
+
+                st.divider()
+                st.markdown("### Eliminar usuario")
+                if candidates:
+                    pick2 = st.selectbox(
+                        "Selecciona usuario",
+                        [f"{uname} (Admin: {'Sí' if int(adm)==1 else 'No'}) | ID {uid}" for uid, uname, adm in candidates],
+                        key="pick_del_user",
+                    )
+                    picked_id2 = int(pick2.split("ID")[-1].strip())
+                    confirm = st.checkbox(
+                        "Confirmo eliminar este usuario definitivamente",
+                        value=False,
+                        key="confirm_del_user",
+                    )
+                    if st.button("Eliminar usuario", disabled=not confirm, key="btn_del_user"):
+                        user_delete(CLIENT, picked_id2)
+                        st.success("✅ Usuario eliminado.")
+                        st.rerun()
+
+            with sub3:
+                st.markdown("### Resetear contraseña (solo admin)")
+                st.caption("Asigna una contraseña nueva a un usuario sin conocer la actual.")
+
+                users = users_list(CLIENT)
+                current_user = st.session_state.get("logged_user") or ""
+                candidates = [(uid, uname, adm) for uid, uname, adm, _ in users if uname != current_user]
+
+                if not candidates:
+                    st.info("No hay otros usuarios para resetear.")
+                else:
+                    pickr = st.selectbox(
+                        "Usuario a resetear",
+                        [f"{uname} (Admin: {'Sí' if int(adm)==1 else 'No'}) | ID {uid}" for uid, uname, adm in candidates],
+                        key="pick_reset_user",
+                    )
+                    picked_idr = int(pickr.split("ID")[-1].strip())
+
+                    rp1 = st.text_input("Nueva contraseña", type="password", key="reset_pw1")
+                    rp2 = st.text_input("Confirmar nueva contraseña", type="password", key="reset_pw2")
+                    confirm_reset = st.checkbox("Confirmo que deseo resetear la contraseña", value=False, key="confirm_reset")
+
+                    if st.button("Resetear contraseña", type="primary", disabled=not confirm_reset, key="btn_reset_pw"):
+                        try:
+                            if rp1 != rp2:
+                                st.error("Las contraseñas no coinciden.")
+                            else:
+                                user_update_password_by_id(CLIENT, picked_idr, rp1)
+                                st.success("✅ Contraseña reseteada.")
+                                st.session_state["reset_pw1"] = ""
+                                st.session_state["reset_pw2"] = ""
+                                st.session_state["confirm_reset"] = False
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"No se pudo resetear: {e}")
