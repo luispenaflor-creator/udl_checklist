@@ -18,7 +18,6 @@ import requests
 # CONFIG
 # ============================================================
 st.set_page_config(page_title="Checklist UDL", layout="wide")
-
 TZ_MX = ZoneInfo("America/Mexico_City")
 
 STATUS_OPTIONS = [
@@ -73,7 +72,7 @@ ROOMS_BY_CAMPUS = {
         + [f"Taller Costura {i}" for i in range(1, 6)]
         + ["Taller Estampado", "Salon Dibujo"]
     ),
-    "Medellin": [],  # manual, pero dejamos "Agregar nuevo" para todos
+    "Medellin": [],
 }
 
 
@@ -119,7 +118,6 @@ class TursoHTTPClient:
         return {"type": "text", "value": str(v)}
 
     def _parse_cell(self, cell):
-        # Turso pipeline devuelve {type,value} o {type,base64}
         if isinstance(cell, dict):
             t = cell.get("type")
             if t == "null":
@@ -136,15 +134,6 @@ class TursoHTTPClient:
         return cell
 
     def execute(self, sql: str, args=None):
-        """
-        Retorna dict:
-          {
-            "cols": [...],
-            "rows": [...],
-            "affected_row_count": int|None,
-            "last_insert_rowid": int|None
-          }
-        """
         args = args or []
         payload = {
             "requests": [
@@ -153,7 +142,6 @@ class TursoHTTPClient:
             ]
         }
 
-        # Connection: close = evita que proxy/EDR mate keep-alive (10054)
         headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
@@ -163,12 +151,7 @@ class TursoHTTPClient:
         last_err = None
         for attempt in range(1, self.retries + 1):
             try:
-                r = self.session.post(
-                    self.endpoint,
-                    json=payload,
-                    headers=headers,
-                    timeout=self.timeout,
-                )
+                r = self.session.post(self.endpoint, json=payload, headers=headers, timeout=self.timeout)
                 if r.status_code >= 400:
                     raise RuntimeError(f"Turso HTTP {r.status_code}: {r.text[:600]}")
 
@@ -178,7 +161,6 @@ class TursoHTTPClient:
                     return {"cols": [], "rows": [], "affected_row_count": 0, "last_insert_rowid": None}
 
                 res0 = results[0]
-                # algunos formatos: {"type":"ok","response":{...}}
                 if isinstance(res0, dict) and res0.get("type") == "error":
                     raise RuntimeError(f"Turso error: {res0}")
 
@@ -186,17 +168,14 @@ class TursoHTTPClient:
                 if resp and resp.get("type") == "error":
                     raise RuntimeError(f"Turso error: {resp}")
 
-                # result puede venir en res0["response"]["result"] o directo en res0["result"]
                 result = None
                 if isinstance(res0, dict):
                     if resp and isinstance(resp, dict):
-                        # ejemplo real: response: { type: execute, result: { cols, rows, ... } }
                         result = resp.get("result") or resp.get("response", {}).get("result")
                     if result is None:
                         result = res0.get("result")
 
                 if result is None:
-                    # fallback (por si cambia el shape)
                     return {"cols": [], "rows": [], "affected_row_count": None, "last_insert_rowid": None}
 
                 cols = result.get("cols") or []
@@ -223,19 +202,15 @@ class TursoHTTPClient:
 
 @st.cache_resource
 def get_client_cached(url: str, token: str):
-    # timeouts/retries “agresivos” para redes inestables
     return TursoHTTPClient(url, token, timeout=45, retries=6)
 
 
 def get_client():
-    # secrets primero; env después
     url = get_secret("TURSO_DATABASE_URL") or os.environ.get("TURSO_DATABASE_URL")
     token = get_secret("TURSO_AUTH_TOKEN") or os.environ.get("TURSO_AUTH_TOKEN")
-
     if not url or not token:
         st.error("Faltan TURSO_DATABASE_URL / TURSO_AUTH_TOKEN en secrets.toml o variables de entorno.")
         st.stop()
-
     return get_client_cached(url, token), url
 
 
@@ -259,106 +234,8 @@ def fetch_all(client, sql, args=None):
     return res["rows"]
 
 
-def migrate_inspection_items_allow_danado_y_dañado(client):
-    """
-    Repara tablas antiguas que NO aceptan 'DAÑADO_*' por CHECK.
-    Importante: en Turso HTTP pipeline NO podemos usar BEGIN/COMMIT en llamadas separadas.
-    Entonces hacemos migración sin transacción (idempotente y segura).
-    """
-    row = fetch_one(
-        client,
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='inspection_items'",
-        [],
-    )
-    if not row or not row[0]:
-        return
-
-    ddl = row[0]
-    if "DAÑADO" in ddl:
-        return  # ya está migrada
-
-    # Evitar FK durante swap
-    try:
-        client.execute("PRAGMA foreign_keys = OFF", [])
-    except Exception:
-        pass
-
-    # 1) Crear nueva tabla (si no existe)
-    client.execute("""
-    CREATE TABLE IF NOT EXISTS inspection_items_new (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      inspection_id TEXT NOT NULL,
-      asset_type_id INTEGER NOT NULL,
-      status TEXT NOT NULL CHECK (
-        status IN (
-          'OK',
-          'FALTA_REPOSICION',
-          'NO_FUNCIONA_MANTENIMIENTO',
-          'DAÑADO_REPOSICION',
-          'DAÑADO_MANTENIMIENTO',
-          'DANADO_REPOSICION',
-          'DANADO_MANTENIMIENTO',
-          'N_A'
-        )
-      ),
-      condition TEXT NOT NULL CHECK (condition IN ('BUENO','REGULAR','MALO','N_A')),
-      notes TEXT,
-      FOREIGN KEY (inspection_id) REFERENCES inspections(id) ON DELETE CASCADE,
-      FOREIGN KEY (asset_type_id) REFERENCES asset_types(id),
-      UNIQUE (inspection_id, asset_type_id)
-    )
-    """, [])
-
-    # 2) Copiar SOLO si la nueva está vacía (para que sea idempotente)
-    cnt = fetch_one(client, "SELECT COUNT(*) FROM inspection_items_new", [])
-    if cnt and int(cnt[0]) == 0:
-        client.execute("""
-        INSERT INTO inspection_items_new (id, inspection_id, asset_type_id, status, condition, notes)
-        SELECT
-          id,
-          inspection_id,
-          asset_type_id,
-          CASE
-            WHEN status='DANADO_REPOSICION' THEN 'DAÑADO_REPOSICION'
-            WHEN status='DANADO_MANTENIMIENTO' THEN 'DAÑADO_MANTENIMIENTO'
-            ELSE status
-          END AS status,
-          condition,
-          notes
-        FROM inspection_items
-        """, [])
-
-    # 3) Swap: borrar vieja y renombrar nueva (solo si sigue existiendo la vieja)
-    exists_old = fetch_one(
-        client,
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='inspection_items'",
-        [],
-    )
-    exists_new = fetch_one(
-        client,
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='inspection_items_new'",
-        [],
-    )
-
-    if exists_old and exists_new:
-        # Ojo: al dropear la tabla vieja se borrarían hijos por FK si foreign_keys=ON, por eso estaba OFF
-        client.execute("DROP TABLE inspection_items", [])
-        client.execute("ALTER TABLE inspection_items_new RENAME TO inspection_items", [])
-
-    # 4) Índice
-    client.execute(
-        "CREATE INDEX IF NOT EXISTS idx_items_asset_status ON inspection_items(asset_type_id, status)",
-        [],
-    )
-
-    try:
-        client.execute("PRAGMA foreign_keys = ON", [])
-    except Exception:
-        pass
-
-
 # ============================================================
-# SCHEMA + SEED
+# SCHEMA + MIGRATIONS + SETTINGS
 # ============================================================
 def init_db(client):
     schema = """
@@ -389,8 +266,8 @@ def init_db(client):
       campus_id INTEGER NOT NULL,
       room_id INTEGER NOT NULL,
       guard_name TEXT NOT NULL,
-      inspected_on TEXT NOT NULL, -- YYYY-MM-DD
-      inspected_at TEXT,          -- YYYY-MM-DD HH:MM:SS (MX)
+      inspected_on TEXT NOT NULL,
+      inspected_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       comments TEXT,
       FOREIGN KEY (campus_id) REFERENCES campuses(id),
@@ -409,6 +286,8 @@ def init_db(client):
           'NO_FUNCIONA_MANTENIMIENTO',
           'DAÑADO_REPOSICION',
           'DAÑADO_MANTENIMIENTO',
+          'DANADO_REPOSICION',
+          'DANADO_MANTENIMIENTO',
           'N_A'
         )
       ),
@@ -441,35 +320,6 @@ def init_db(client):
     """
     exec_many(client, schema)
 
-    # migración suave de posibles valores viejos
-    try:
-        client.execute("UPDATE inspection_items SET status='DAÑADO_REPOSICION' WHERE status='DANADO_REPOSICION'")
-        client.execute("UPDATE inspection_items SET status='DAÑADO_MANTENIMIENTO' WHERE status='DANADO_MANTENIMIENTO'")
-    except Exception:
-        pass
-
-
-def seed_data(client):
-    for c in CAMPUSES:
-        client.execute("INSERT OR IGNORE INTO campuses(name) VALUES (?)", [c])
-
-    for name, order in ASSETS:
-        client.execute(
-            "INSERT OR IGNORE INTO asset_types(name, sort_order) VALUES (?, ?)",
-            [name, order],
-        )
-
-    for campus_name, rooms in ROOMS_BY_CAMPUS.items():
-        row = fetch_one(client, "SELECT id FROM campuses WHERE name = ?", [campus_name])
-        if not row:
-            continue
-        campus_id = int(row[0])
-        for room_code in rooms:
-            client.execute(
-                "INSERT OR IGNORE INTO rooms(campus_id, room_code) VALUES (?, ?)",
-                [campus_id, room_code],
-            )
-
 
 def settings_get(client, key: str):
     row = fetch_one(client, "SELECT value FROM app_settings WHERE key = ?", [key])
@@ -487,18 +337,98 @@ def settings_set(client, key: str, value: str):
     )
 
 
+def migrate_inspection_items_allow_danado_y_dañado(client):
+    """
+    Si inspection_items fue creada con CHECK viejo (sin 'DAÑADO'),
+    se recrea sin usar BEGIN/COMMIT (porque Turso HTTP pipeline no mantiene transacción entre requests).
+    """
+    row = fetch_one(
+        client,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='inspection_items'",
+        [],
+    )
+    if not row or not row[0]:
+        return
+
+    ddl = row[0]
+    if "DAÑADO" in ddl:
+        return
+
+    try:
+        client.execute("PRAGMA foreign_keys = OFF", [])
+    except Exception:
+        pass
+
+    client.execute("""
+    CREATE TABLE IF NOT EXISTS inspection_items_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      inspection_id TEXT NOT NULL,
+      asset_type_id INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK (
+        status IN (
+          'OK',
+          'FALTA_REPOSICION',
+          'NO_FUNCIONA_MANTENIMIENTO',
+          'DAÑADO_REPOSICION',
+          'DAÑADO_MANTENIMIENTO',
+          'DANADO_REPOSICION',
+          'DANADO_MANTENIMIENTO',
+          'N_A'
+        )
+      ),
+      condition TEXT NOT NULL CHECK (condition IN ('BUENO','REGULAR','MALO','N_A')),
+      notes TEXT,
+      FOREIGN KEY (inspection_id) REFERENCES inspections(id) ON DELETE CASCADE,
+      FOREIGN KEY (asset_type_id) REFERENCES asset_types(id),
+      UNIQUE (inspection_id, asset_type_id)
+    )
+    """, [])
+
+    cnt = fetch_one(client, "SELECT COUNT(*) FROM inspection_items_new", [])
+    if cnt and int(cnt[0]) == 0:
+        client.execute("""
+        INSERT INTO inspection_items_new (id, inspection_id, asset_type_id, status, condition, notes)
+        SELECT
+          id,
+          inspection_id,
+          asset_type_id,
+          CASE
+            WHEN status='DANADO_REPOSICION' THEN 'DAÑADO_REPOSICION'
+            WHEN status='DANADO_MANTENIMIENTO' THEN 'DAÑADO_MANTENIMIENTO'
+            ELSE status
+          END AS status,
+          condition,
+          notes
+        FROM inspection_items
+        """, [])
+
+    exists_old = fetch_one(client, "SELECT name FROM sqlite_master WHERE type='table' AND name='inspection_items'", [])
+    exists_new = fetch_one(client, "SELECT name FROM sqlite_master WHERE type='table' AND name='inspection_items_new'", [])
+    if exists_old and exists_new:
+        client.execute("DROP TABLE inspection_items", [])
+        client.execute("ALTER TABLE inspection_items_new RENAME TO inspection_items", [])
+
+    client.execute(
+        "CREATE INDEX IF NOT EXISTS idx_items_asset_status ON inspection_items(asset_type_id, status)",
+        [],
+    )
+
+    try:
+        client.execute("PRAGMA foreign_keys = ON", [])
+    except Exception:
+        pass
+
+
 def ensure_db_setup(client):
-    # 1) Esquema base
     if not st.session_state.get("_schema_ok", False):
         init_db(client)
         st.session_state["_schema_ok"] = True
 
-    # 2) Migración DAÑADO / DANADO (solo una vez)
     if settings_get(client, "migrated_items_danado") != "1":
         migrate_inspection_items_allow_danado_y_dañado(client)
         settings_set(client, "migrated_items_danado", "1")
 
-    # 3) SIEMPRE sincronizar catálogos
+    # SIEMPRE sincronizar catálogos
     for c in CAMPUSES:
         client.execute("INSERT OR IGNORE INTO campuses(name) VALUES (?)", [c])
 
@@ -519,7 +449,6 @@ def ensure_db_setup(client):
                 [campus_id, room_code],
             )
 
-    # 4) Marca setup done
     if settings_get(client, "db_setup_done") != "1":
         settings_set(client, "db_setup_done", "1")
 
@@ -580,7 +509,6 @@ def admin_check_login(client, user: str, password: str) -> bool:
 
 
 def admin_first_run_setup(client):
-    # setup inline (sin st.dialog) para máxima compatibilidad
     if admin_is_configured(client):
         return
 
@@ -644,32 +572,78 @@ def admin_login_sidebar(client):
 
 
 # ============================================================
-# CACHES
+# CACHES (DB)
 # ============================================================
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)
 def cached_campus_id(campus_name: str):
     row = fetch_one(CLIENT, "SELECT id FROM campuses WHERE name = ?", [campus_name])
     return int(row[0])
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)
 def cached_assets():
     return fetch_all(CLIENT, "SELECT id, name FROM asset_types ORDER BY sort_order, name")
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=600)
 def cached_rooms(campus_id: int):
     return fetch_all(CLIENT, "SELECT id, room_code FROM rooms WHERE campus_id = ? ORDER BY room_code", [campus_id])
 
 
+def get_rooms_for_campus(campus_id: int):
+    key = f"rooms_{campus_id}"
+    if key not in st.session_state:
+        st.session_state[key] = cached_rooms(campus_id)
+    return st.session_state[key]
+
+
+def invalidate_rooms_cache(campus_id: int):
+    key = f"rooms_{campus_id}"
+    if key in st.session_state:
+        del st.session_state[key]
+    cached_rooms.clear()
+
+
 # ============================================================
-# APP START (anti pantalla negra + mensajes claros)
+# FORM RESET LOGIC (para que quede todo vacío al cambiar plantel / nuevo registro)
+# ============================================================
+def new_form_nonce():
+    st.session_state["form_nonce"] = str(uuid.uuid4())
+
+
+def current_nonce() -> str:
+    if "form_nonce" not in st.session_state:
+        new_form_nonce()
+    return st.session_state["form_nonce"]
+
+
+def track_campus_change(campus_value: str):
+    prev = st.session_state.get("campus_prev")
+    if prev != campus_value:
+        st.session_state["campus_prev"] = campus_value
+        new_form_nonce()
+
+
+# ============================================================
+# SUCCESS MODAL
+# ============================================================
+@st.dialog("✅ Registro enviado")
+def registro_enviado_dialog(resumen: str):
+    st.success("Tu registro fue enviado correctamente.")
+    st.write(resumen)
+    if st.button("Aceptar / Nuevo registro", type="primary"):
+        new_form_nonce()
+        st.session_state["show_sent_dialog"] = False
+        st.rerun()
+
+
+# ============================================================
+# APP START
 # ============================================================
 st.title("Checklist diario de activos - UDL")
 
 boot = st.empty()
 boot.info("Iniciando… conectando a Turso (HTTP /v2/pipeline).")
-
 with st.spinner("Conectando a Turso…"):
     CLIENT, DB_URL = get_client()
     try:
@@ -677,19 +651,13 @@ with st.spinner("Conectando a Turso…"):
     except Exception as e:
         boot.error(f"No puedo conectar con Turso por HTTP (/v2/pipeline).\n\nDetalle: {e}")
         st.stop()
-
-boot.success("Conectado ✅")
 boot.empty()
 
 ensure_db_setup(CLIENT)
-cached_assets.clear()
-cached_rooms.clear()
-
-# Admin
 admin_first_run_setup(CLIENT)
 admin_login_sidebar(CLIENT)
 
-tab_new, tab_query = st.tabs(["📝 Nueva revisión", "🔎 Consultas",])
+tab_new, tab_query = st.tabs(["📝 Nueva revisión", "🔎 Consultas"])
 
 
 # ============================================================
@@ -699,157 +667,219 @@ with tab_new:
     st.subheader("Nueva revisión diaria (1 por salón por día)")
     st.caption("La fecha es automática (hora México CDMX).")
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        campus = st.selectbox("Plantel", CAMPUSES, index=0, key="campus_sel")
+    # Si hay confirmación pendiente, mostrar dialog
+    if st.session_state.get("show_sent_dialog") and st.session_state.get("sent_summary"):
+        registro_enviado_dialog(st.session_state["sent_summary"])
+
+    # Plantel fuera del form para poder detectar cambio y resetear keys
+    campus = st.selectbox("Plantel", ["(Selecciona...)"] + CAMPUSES, index=0, key="campus_selector")
+    if campus != "(Selecciona...)":
+        track_campus_change(campus)
+
+    nonce = current_nonce()
+
+    # Si aún no eligen plantel, no mostramos el form
+    if campus == "(Selecciona...)":
+        st.info("Selecciona un plantel para iniciar un registro.")
+        st.stop()
 
     campus_id = cached_campus_id(campus)
+    today_mx = datetime.now(TZ_MX).date()
+    inspected_on = today_mx
+    inspected_on_str = inspected_on.strftime("%Y-%m-%d")
+    inspected_at_str = datetime.now(TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
 
-    with c2:
-        rooms = cached_rooms(campus_id)
-        room_map = {r[1]: int(r[0]) for r in rooms}
+    with st.form(f"new_inspection_form_{nonce}", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
 
-        st.caption("Selecciona un salón existente o agrega uno nuevo.")
-        options = ["(Agregar nuevo...)"] + list(room_map.keys())
-        choice = st.selectbox("Salón / Área", options, key="room_sel")
+        with c1:
+            st.text_input("Fecha (automática)", value=inspected_on_str, disabled=True)
+
+        with c2:
+            rooms = get_rooms_for_campus(campus_id)
+            room_map = {r[1]: int(r[0]) for r in rooms}
+            options = ["(Selecciona...)"] + list(room_map.keys()) + ["(Agregar nuevo...)"]
+            choice = st.selectbox("Salón / Área", options, index=0, key=f"room_sel_{nonce}")
+
+        with c3:
+            guard_name = st.text_input(
+                "Nombre del vigilante (obligatorio)",
+                key=f"guard_{nonce}",
+                placeholder="Ej. Juan Pérez",
+            )
 
         room_id = None
         room_code = None
-
         if choice == "(Agregar nuevo...)":
             new_room = st.text_input(
                 "Nombre del salón/área (nuevo)",
-                key="new_room",
+                key=f"new_room_{nonce}",
                 placeholder="Ej. Salon Morado / Aula Azul / Lab X",
             )
             new_room = " ".join((new_room or "").strip().split())
             if new_room:
-                CLIENT.execute(
-                    "INSERT OR IGNORE INTO rooms(campus_id, room_code) VALUES (?, ?)",
-                    [campus_id, new_room],
-                )
-                cached_rooms.clear()
-                row = fetch_one(
-                    CLIENT,
-                    "SELECT id FROM rooms WHERE campus_id = ? AND room_code = ?",
-                    [campus_id, new_room],
-                )
-                room_id = int(row[0]) if row else None
                 room_code = new_room
-        else:
+        elif choice not in ("(Selecciona...)",):
             room_code = choice
             room_id = room_map.get(choice)
 
-    with c3:
-        today_mx = datetime.now(TZ_MX).date()
-        inspected_on = today_mx
-        st.text_input("Fecha (automática)", value=inspected_on.strftime("%Y-%m-%d"), disabled=True)
+        comments = st.text_area("Comentarios generales (opcional)", key=f"comments_{nonce}")
 
-    guard_name = st.text_input("Nombre del vigilante (obligatorio)", key="guard_name", placeholder="Ej. Juan Pérez")
-    comments = st.text_area("Comentarios generales (opcional)", key="comments")
+        st.markdown("### Checklist de activos")
+        st.caption("⚠️ Foto obligatoria solo si el estatus es DAÑADO. En celular podrás tomarla o subirla.")
 
-    asset_rows = cached_assets()
-    st.markdown("### Checklist (📷 Tomar/Subir foto **solo** si está **DAÑADO**)")
+        asset_rows = cached_assets()
 
-    items_payload = []
-    damaged_missing_photo = []
+        items_payload = []
+        missing = []
+        missing_photo = []
 
-    for asset_id, asset_name in asset_rows:
-        asset_id = int(asset_id)
-        with st.container(border=True):
-            st.markdown(f"**{asset_name}**")
+        for asset_id, asset_name in asset_rows:
+            asset_id = int(asset_id)
+            with st.container(border=True):
+                st.markdown(f"**{asset_name}**")
 
-            a1, a2, a3 = st.columns([1, 1, 2])
+                a1, a2, a3 = st.columns([1, 1, 2])
 
-            with a1:
-                status = st.selectbox("Estatus/Acción", STATUS_OPTIONS, key=f"status_{asset_id}")
-
-            with a2:
-                cond_key = f"cond_{asset_id}"
-                if cond_key not in st.session_state:
-                    st.session_state[cond_key] = "BUENO"
-
-                if status == "N_A":
-                    st.session_state[cond_key] = "N_A"
-                    cond = st.selectbox("Condición", COND_OPTIONS, key=cond_key, disabled=True)
-                    cond = "N_A"
-                else:
-                    if st.session_state.get(cond_key) == "N_A":
-                        st.session_state[cond_key] = "BUENO"
-                    cond = st.selectbox("Condición", COND_OPTIONS, key=cond_key)
-
-            with a3:
-                note = st.text_input("Notas", key=f"note_{asset_id}", placeholder="Opcional")
-
-            photo = None
-            if status.startswith("DAÑADO"):
-                st.markdown("📷 **Tomar/Subir foto (obligatorio si está DAÑADO)**")
-                photo = st.file_uploader(
-                    f"Tomar/Subir foto - {asset_name}",
-                    type=["jpg", "jpeg", "png"],
-                    accept_multiple_files=False,
-                    key=f"photo_{asset_id}",
-                    help="En celular suele aparecer Cámara/Galería según el navegador.",
+                # --- Estatus vacío por defecto ---
+                status = st.selectbox(
+                    "Estatus/Acción",
+                    ["(Selecciona...)"] + STATUS_OPTIONS,
+                    index=0,
+                    key=f"status_{nonce}_{asset_id}",
                 )
-                if photo is None:
-                    damaged_missing_photo.append(asset_name)
 
-        items_payload.append((asset_id, asset_name, status, cond, note, photo))
+                # --- Condición vacía por defecto (o N_A si status==N_A) ---
+                if status == "N_A":
+                    condition = st.selectbox(
+                        "Condición",
+                        ["N_A"],
+                        index=0,
+                        key=f"cond_{nonce}_{asset_id}",
+                        disabled=True,
+                    )
+                    condition = "N_A"
+                else:
+                    condition = st.selectbox(
+                        "Condición",
+                        ["(Selecciona...)"] + COND_OPTIONS,
+                        index=0,
+                        key=f"cond_{nonce}_{asset_id}",
+                    )
 
-    save_disabled = (not room_id) or (not (guard_name or "").strip())
-    submitted = st.button("Guardar revisión", type="primary", disabled=save_disabled)
+                note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
 
-    if submitted:
-        if damaged_missing_photo:
-            st.error("Falta foto en activos marcados como **DAÑADO**: " + ", ".join(damaged_missing_photo))
-            st.stop()
+                photo = None
+                if isinstance(status, str) and status.startswith("DAÑADO"):
+                    st.markdown("📷 **Tomar/Subir foto (obligatorio por DAÑADO)**")
+                    photo = st.file_uploader(
+                        f"Foto - {asset_name}",
+                        type=["jpg", "jpeg", "png"],
+                        accept_multiple_files=False,
+                        key=f"photo_{nonce}_{asset_id}",
+                        help="En celular aparece Cámara/Galería según el navegador.",
+                    )
 
-        inspected_on_str = inspected_on.strftime("%Y-%m-%d")
-        inspected_at_str = datetime.now(TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
+            items_payload.append((asset_id, asset_name, status, condition, note, photo))
 
-        inspection_id = str(uuid.uuid4())
-        try:
-            CLIENT.execute(
-                """
-                INSERT INTO inspections(id, campus_id, room_id, guard_name, inspected_on, inspected_at, comments)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    inspection_id,
-                    campus_id,
-                    room_id,
-                    guard_name.strip(),
-                    inspected_on_str,
-                    inspected_at_str,
-                    (comments or "").strip() or None,
-                ],
-            )
-        except Exception:
-            st.error(
-                f"⚠️ Ya existe una revisión para **{campus} / {room_code}** "
-                f"en la fecha **{inspected_on_str}**.\n\n"
-                "No se puede guardar dos veces el mismo salón el mismo día."
-            )
-            st.stop()
+        submitted = st.form_submit_button("Guardar revisión")
 
-        for asset_type_id, asset_name, status, cond, note, photo in items_payload:
-            CLIENT.execute(
-                """
-                INSERT INTO inspection_items(inspection_id, asset_type_id, status, condition, notes)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                [inspection_id, asset_type_id, status, cond, (note or "").strip() or None],
-            )
+        if submitted:
+            # Validaciones generales
+            if not (guard_name or "").strip():
+                st.error("Falta el nombre del vigilante.")
+                st.stop()
 
-            row = fetch_one(
-                CLIENT,
-                "SELECT id FROM inspection_items WHERE inspection_id = ? AND asset_type_id = ?",
-                [inspection_id, asset_type_id],
-            )
-            inspection_item_id = int(row[0])
+            if not room_code or room_code in ("(Selecciona...)",):
+                st.error("Selecciona un salón/área o agrega uno nuevo.")
+                st.stop()
 
-            if photo is not None:
-                try:
+            # Validaciones por activo (estatus y condición obligatorios)
+            for _, asset_name, status, condition, _, photo in items_payload:
+                if status == "(Selecciona...)":
+                    missing.append(asset_name)
+                elif condition == "(Selecciona...)" and status != "N_A":
+                    missing.append(asset_name)
+
+                if isinstance(status, str) and status.startswith("DAÑADO") and photo is None:
+                    missing_photo.append(asset_name)
+
+            if missing:
+                st.error("Faltan seleccionar estatus/condición en: " + ", ".join(missing))
+                st.stop()
+
+            if missing_photo:
+                st.error("Falta foto en activos marcados como **DAÑADO**: " + ", ".join(missing_photo))
+                st.stop()
+
+            # Crear/obtener salón si es nuevo
+            if choice == "(Agregar nuevo...)":
+                CLIENT.execute(
+                    "INSERT OR IGNORE INTO rooms(campus_id, room_code) VALUES (?, ?)",
+                    [campus_id, room_code],
+                )
+                invalidate_rooms_cache(campus_id)
+                row = fetch_one(
+                    CLIENT,
+                    "SELECT id FROM rooms WHERE campus_id = ? AND room_code = ?",
+                    [campus_id, room_code],
+                )
+                room_id = int(row[0]) if row else None
+
+            if not room_id:
+                st.error("No se pudo resolver el salón. Intenta de nuevo.")
+                st.stop()
+
+            inspection_id = str(uuid.uuid4())
+
+            # Insert inspección (bloquea duplicados por UNIQUE room_id + inspected_on)
+            try:
+                CLIENT.execute(
+                    """
+                    INSERT INTO inspections(id, campus_id, room_id, guard_name, inspected_on, inspected_at, comments)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        inspection_id,
+                        campus_id,
+                        room_id,
+                        guard_name.strip(),
+                        inspected_on_str,
+                        inspected_at_str,
+                        (comments or "").strip() or None,
+                    ],
+                )
+            except Exception:
+                st.error(
+                    f"⚠️ Ya existe una revisión para **{campus} / {room_code}** en **{inspected_on_str}**.\n\n"
+                    "No se puede guardar dos veces el mismo salón el mismo día."
+                )
+                st.stop()
+
+            # Insert items + foto
+            for asset_type_id, asset_name, status, condition, note, photo in items_payload:
+                CLIENT.execute(
+                    """
+                    INSERT INTO inspection_items(inspection_id, asset_type_id, status, condition, notes)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        inspection_id,
+                        asset_type_id,
+                        status,
+                        condition,
+                        (note or "").strip() or None,
+                    ],
+                )
+
+                row_item = fetch_one(
+                    CLIENT,
+                    "SELECT id FROM inspection_items WHERE inspection_id = ? AND asset_type_id = ?",
+                    [inspection_id, asset_type_id],
+                )
+                inspection_item_id = int(row_item[0])
+
+                if photo is not None:
                     blob, mime_type, file_name = compress_image(photo)
                     CLIENT.execute(
                         """
@@ -858,11 +888,16 @@ with tab_new:
                         """,
                         [inspection_item_id, mime_type, file_name, blob],
                     )
-                except Exception as e:
-                    st.warning(f"No se guardó la foto de '{asset_name}': {e}")
 
-        st.success("✅ Revisión guardada correctamente.")
-        cached_rooms.clear()
+            # Mostrar dialog y reset
+            st.session_state["sent_summary"] = (
+                f"Plantel: **{campus}**\n\n"
+                f"Salón/Área: **{room_code}**\n\n"
+                f"Vigilante: **{guard_name.strip()}**\n\n"
+                f"Fecha: **{inspected_on_str}**"
+            )
+            st.session_state["show_sent_dialog"] = True
+            st.rerun()
 
 
 # ============================================================
@@ -902,7 +937,7 @@ with tab_query:
     rows = fetch_all(CLIENT, sql, args)
     st.write(f"Resultados: **{len(rows)}**")
 
-    for inspected_on, campus_name, room_code, guard_name, comments, ins_id in rows[:60]:
+    for inspected_on, campus_name, room_code, guard_name, comments, ins_id in rows[:80]:
         with st.expander(f"{inspected_on} | {campus_name} | {room_code} | {guard_name}"):
             items = fetch_all(
                 CLIENT,
@@ -915,6 +950,7 @@ with tab_query:
                 """,
                 [ins_id],
             )
+
             for item_id, a_name, stt, cond, note in items:
                 st.write(f"- **{a_name}**: {stt} / {cond}" + (f" — {note}" if note else ""))
 
@@ -938,7 +974,7 @@ with tab_query:
 
 
 # ============================================================
-# ADMIN PANEL
+# ADMIN PANEL (opcional)
 # ============================================================
 if is_admin():
     st.divider()
@@ -1046,4 +1082,3 @@ if is_admin():
             )
         else:
             st.info("Sin incidencias en ese rango.")
-
