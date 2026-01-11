@@ -57,15 +57,12 @@ ROOMS_BY_CAMPUS = {
     "Medellin": [],
 }
 
+# ✅ NUEVAS OPCIONES (sin condición)
 STATUS_OPTIONS = [
     "OK",
-    "FALTA_REPOSICION",
-    "NO_FUNCIONA_MANTENIMIENTO",
-    "DAÑADO_REPOSICION",
-    "DAÑADO_MANTENIMIENTO",
-    "N_A",
+    "FALTA",
+    "DAÑADO / NO FUNCIONA",
 ]
-COND_OPTIONS = ["BUENO", "REGULAR", "MALO", "N_A"]
 
 
 # =========================
@@ -249,23 +246,13 @@ def init_db(client):
       UNIQUE (room_id, inspected_on)
     );
 
+    -- Nota: condition se conserva en DB por compatibilidad, pero la app ya no la usa (se guarda como 'N_A').
     CREATE TABLE IF NOT EXISTS inspection_items (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       inspection_id TEXT NOT NULL,
       asset_type_id INTEGER NOT NULL,
-      status TEXT NOT NULL CHECK (
-        status IN (
-          'OK',
-          'FALTA_REPOSICION',
-          'NO_FUNCIONA_MANTENIMIENTO',
-          'DAÑADO_REPOSICION',
-          'DAÑADO_MANTENIMIENTO',
-          'DANADO_REPOSICION',
-          'DANADO_MANTENIMIENTO',
-          'N_A'
-        )
-      ),
-      condition TEXT NOT NULL CHECK (condition IN ('BUENO','REGULAR','MALO','N_A')),
+      status TEXT NOT NULL,
+      condition TEXT NOT NULL DEFAULT 'N_A',
       notes TEXT,
       FOREIGN KEY (inspection_id) REFERENCES inspections(id) ON DELETE CASCADE,
       FOREIGN KEY (asset_type_id) REFERENCES asset_types(id),
@@ -602,7 +589,7 @@ def get_inspection_items(ins_id: str):
     return fetch_all(
         CLIENT,
         """
-        SELECT a.id as asset_type_id, a.name, it.status, it.condition, COALESCE(it.notes,'')
+        SELECT a.id as asset_type_id, a.name, it.status, COALESCE(it.notes,'')
         FROM inspection_items it
         JOIN asset_types a ON a.id = it.asset_type_id
         WHERE it.inspection_id = ?
@@ -625,44 +612,26 @@ def edit_inspection_dialog(ins_id: str):
     guard_new = st.text_input("Vigilante", value=guard_name or "")
     comments_new = st.text_area("Comentarios generales", value=comments or "")
 
-    st.markdown("### Items")
+    st.markdown("### Estatus de equipos")
     items = get_inspection_items(ins_id)
 
     edited = []
-    for asset_type_id, asset_name, stt, cond, note in items:
+    for asset_type_id, asset_name, stt, note in items:
         with st.container(border=True):
             st.markdown(f"**{asset_name}**")
 
             k_status = f"edit_st_{ins_id}_{asset_type_id}"
-            k_cond = f"edit_cd_{ins_id}_{asset_type_id}"
             k_note = f"edit_nt_{ins_id}_{asset_type_id}"
 
             status_val = st.selectbox(
-                "Estatus/Acción",
+                "Estatus del equipo",
                 STATUS_OPTIONS,
                 index=STATUS_OPTIONS.index(stt) if stt in STATUS_OPTIONS else 0,
                 key=k_status,
             )
 
-            if status_val == "N_A":
-                st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=k_cond)
-                cond_val = "N_A"
-            else:
-                opts = ["BUENO", "REGULAR", "MALO"]
-                default_cond = cond if cond in opts else "BUENO"
-                cond_val = st.selectbox(
-                    "Condición",
-                    opts,
-                    index=opts.index(default_cond),
-                    key=k_cond,
-                )
-
             note_val = st.text_input("Notas", value=note or "", key=k_note)
-
-            if status_val == "N_A":
-                cond_val = "N_A"
-
-            edited.append((int(asset_type_id), status_val, cond_val, (note_val or "").strip() or None))
+            edited.append((int(asset_type_id), status_val, (note_val or "").strip() or None))
 
     st.divider()
     c1, c2 = st.columns(2)
@@ -679,14 +648,15 @@ def edit_inspection_dialog(ins_id: str):
                 ],
             )
 
-            for asset_type_id, status_val, cond_val, note_val in edited:
+            for asset_type_id, status_val, note_val in edited:
+                # condition se guarda como N_A por compatibilidad
                 CLIENT.execute(
                     """
                     UPDATE inspection_items
-                    SET status=?, condition=?, notes=?
+                    SET status=?, condition='N_A', notes=?
                     WHERE inspection_id=? AND asset_type_id=?
                     """,
-                    [status_val, cond_val, note_val, ins_id, asset_type_id],
+                    [status_val, note_val, ins_id, asset_type_id],
                 )
 
             st.success("✅ Cambios guardados.")
@@ -726,7 +696,7 @@ migrate_legacy_admin_to_users(CLIENT)
 admin_first_run_setup(CLIENT)
 admin_login_sidebar(CLIENT)
 
-# Tabs: Nueva revisión siempre; Consultas y Gestión solo con login
+# Tabs: Nueva revisión siempre; Consultas y Usuarios solo con login
 if is_logged():
     tab_new, tab_query, tab_users = st.tabs(["📝 Nueva revisión", "🔎 Consultas", "👥 Usuarios"])
 else:
@@ -738,7 +708,7 @@ else:
 # =========================
 with tab_new:
     st.subheader("Nueva revisión diaria (1 por salón por día)")
-    st.caption("✅ Captura abierta para vigilantes sin cuenta. 🔐 Consultas y Usuarios requieren iniciar sesión (CDMX).")
+    st.caption("Captura abierta para vigilantes sin cuenta. Consultas/Usuarios requieren login.")
 
     if st.session_state.get("show_sent_dialog") and st.session_state.get("sent_summary"):
         registro_enviado_dialog(st.session_state["sent_summary"])
@@ -753,6 +723,28 @@ with tab_new:
         campus_id = cached_campus_id(campus)
         today_mx = datetime.now(TZ_MX).date()
         inspected_on_str = today_mx.strftime("%Y-%m-%d")
+
+        # ✅ Vista simple para vigilantes: qué salones ya registraron hoy (solo nombres)
+        st.markdown("### ✅ Salones ya registrados hoy")
+        reg_rooms = fetch_all(
+            CLIENT,
+            """
+            SELECT r.room_code
+            FROM inspections i
+            JOIN rooms r ON r.id = i.room_id
+            WHERE i.campus_id = ? AND i.inspected_on = ?
+            ORDER BY r.room_code
+            """,
+            [campus_id, inspected_on_str],
+        )
+        registered_list = [r[0] for r in reg_rooms] if reg_rooms else []
+        if not registered_list:
+            st.info("Aún no hay salones registrados hoy en este plantel.")
+        else:
+            st.caption("Solo se muestra el salón (no el detalle).")
+            st.write(" • " + "  |  ".join(registered_list))
+
+        st.divider()
 
         rooms = get_rooms_for_campus(campus_id)
         room_map = {r[1]: int(r[0]) for r in rooms}
@@ -787,8 +779,8 @@ with tab_new:
         nonce = current_nonce()
 
         with st.form(f"new_inspection_form_{nonce}", clear_on_submit=False):
-            st.markdown("### Checklist de activos")
-            st.caption("Selecciona estatus y condición por cada activo (obligatorio).")
+            st.markdown("### Estatus de equipos")
+            st.caption("Selecciona el estatus por cada equipo (obligatorio).")
 
             asset_rows = cached_assets()
             items_payload = []
@@ -800,28 +792,15 @@ with tab_new:
                     st.markdown(f"**{asset_name}**")
 
                     status_key = f"status_{nonce}_{asset_id}"
-                    cond_key = f"cond_{nonce}_{asset_id}"
-
                     status = st.selectbox(
-                        "Estatus/Acción",
+                        "Estatus del equipo",
                         ["(Selecciona...)"] + STATUS_OPTIONS,
                         index=0,
                         key=status_key,
                     )
 
-                    if status == "N_A":
-                        st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=cond_key)
-                        cond = "N_A"
-                    else:
-                        cond = st.selectbox(
-                            "Condición",
-                            ["(Selecciona...)"] + COND_OPTIONS,
-                            index=0,
-                            key=cond_key,
-                        )
-
                     note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
-                    items_payload.append((asset_id, asset_name, status, cond, note))
+                    items_payload.append((asset_id, asset_name, status, note))
 
             submitted = st.form_submit_button("Guardar revisión")
 
@@ -834,19 +813,12 @@ with tab_new:
                 st.error("Selecciona un salón/área o agrega uno nuevo.")
                 st.stop()
 
-            items_payload = [
-                (asset_type_id, asset_name, status, ("N_A" if status == "N_A" else cond), note)
-                for (asset_type_id, asset_name, status, cond, note) in items_payload
-            ]
-
-            for _, asset_name, status, cond, _ in items_payload:
+            for _, asset_name, status, _ in items_payload:
                 if status == "(Selecciona...)":
-                    missing.append(asset_name)
-                elif status != "N_A" and cond == "(Selecciona...)":
                     missing.append(asset_name)
 
             if missing:
-                st.error("Faltan seleccionar estatus/condición en: " + ", ".join(missing))
+                st.error("Faltan seleccionar estatus en: " + ", ".join(missing))
                 st.stop()
 
             if choice == "(Agregar nuevo...)":
@@ -892,17 +864,17 @@ with tab_new:
                 )
                 st.stop()
 
-            for asset_type_id, _, status, cond, note in items_payload:
+            for asset_type_id, _, status, note in items_payload:
+                # condition se guarda como N_A por compatibilidad con registros anteriores
                 CLIENT.execute(
                     """
                     INSERT INTO inspection_items(inspection_id, asset_type_id, status, condition, notes)
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, 'N_A', ?)
                     """,
                     [
                         inspection_id,
                         asset_type_id,
                         status,
-                        cond,
                         (note or "").strip() or None,
                     ],
                 )
@@ -957,9 +929,9 @@ if is_logged():
         with f2:
             guard_q = st.text_input("Filtrar por vigilante (contiene)", value="", key="guard_q")
         with f3:
-            only_incidencias = st.checkbox("Solo incidencias (status ≠ OK/N_A)", value=False, key="only_inc_q")
+            only_incidencias = st.checkbox("Solo incidencias (≠ OK)", value=False, key="only_inc_q")
         with f4:
-            view_mode = st.selectbox("Vista", ["Resumen", "Detalle por revisión", "Detalle por activo"], index=0, key="view_mode")
+            view_mode = st.selectbox("Vista", ["Resumen", "Detalle por revisión", "Detalle por equipo"], index=0, key="view_mode")
 
         campus_id_q = None
         room_q = "(Todos)"
@@ -972,7 +944,7 @@ if is_logged():
         asset_rows = cached_assets()
         asset_names = [r[1] for r in asset_rows]
         activo_q = st.multiselect(
-            "Filtrar activos (opcional)",
+            "Filtrar equipos (opcional)",
             options=["(Todos)"] + asset_names,
             default=["(Todos)"],
             key="activo_q",
@@ -1017,13 +989,12 @@ if is_logged():
             df_rev = pd.DataFrame(rows, columns=["Fecha", "Plantel", "Revisiones"]) if rows else pd.DataFrame(
                 columns=["Fecha", "Plantel", "Revisiones"]
             )
-
             if not df_rev.empty:
                 df_rev["Revisiones"] = pd.to_numeric(df_rev["Revisiones"], errors="coerce").fillna(0).astype(int)
 
             status_where = ""
             if only_incidencias:
-                status_where = " AND it.status NOT IN ('OK','N_A')"
+                status_where = " AND it.status <> 'OK'"
 
             rows2 = fetch_all(
                 CLIENT,
@@ -1100,7 +1071,7 @@ if is_logged():
                         items = fetch_all(
                             CLIENT,
                             """
-                            SELECT a.name, it.status, it.condition, it.notes
+                            SELECT a.name, it.status, it.notes
                             FROM inspection_items it
                             JOIN asset_types a ON a.id = it.asset_type_id
                             WHERE it.inspection_id = ?
@@ -1112,13 +1083,13 @@ if is_logged():
                         if "(Todos)" not in activo_q:
                             items = [x for x in items if x[0] in activo_q]
                         if only_incidencias:
-                            items = [x for x in items if x[1] not in ("OK", "N_A")]
+                            items = [x for x in items if x[1] != "OK"]
 
                         if not items:
-                            st.caption("Sin items que coincidan con los filtros.")
+                            st.caption("Sin equipos que coincidan con los filtros.")
                         else:
-                            for a_name, stt, cond, note in items:
-                                st.write(f"- **{a_name}**: {stt} / {cond}" + (f" — {note}" if note else ""))
+                            for a_name, stt, note in items:
+                                st.write(f"- **{a_name}**: {stt}" + (f" — {note}" if note else ""))
 
                         b1, b2 = st.columns(2)
                         with b1:
@@ -1136,7 +1107,7 @@ if is_logged():
                     edit_inspection_dialog(st.session_state["edit_target"])
 
         else:
-            st.markdown("### Detalle por activo (tabla)")
+            st.markdown("### Detalle por equipo (tabla)")
 
             status_filter = st.multiselect(
                 "Filtrar estatus",
@@ -1149,7 +1120,7 @@ if is_logged():
             extra_args = list(args)
 
             if only_incidencias:
-                extra_sql += " AND it.status NOT IN ('OK','N_A')"
+                extra_sql += " AND it.status <> 'OK'"
 
             if "(Todos)" not in status_filter:
                 placeholders = ",".join(["?"] * len(status_filter))
@@ -1169,9 +1140,8 @@ if is_logged():
                   c.name AS plantel,
                   r.room_code AS salon,
                   i.guard_name AS vigilante,
-                  a.name AS activo,
-                  it.status AS status_accion,
-                  it.condition AS condicion,
+                  a.name AS equipo,
+                  it.status AS estatus,
                   COALESCE(it.notes,'') AS notas,
                   COALESCE(i.comments,'') AS comentarios,
                   i.id AS inspection_id
@@ -1189,21 +1159,21 @@ if is_logged():
             )
 
             if not rows:
-                st.info("Sin resultados con los filtros actuales (activos/status/fechas).")
+                st.info("Sin resultados con los filtros actuales (equipos/status/fechas).")
             else:
                 df = pd.DataFrame(
                     rows,
                     columns=[
-                        "Fecha", "Plantel", "Salon", "Vigilante", "Activo",
-                        "Status/Accion", "Condicion", "Notas", "Comentarios", "InspectionID"
+                        "Fecha", "Plantel", "Salon", "Vigilante", "Equipo",
+                        "Estatus", "Notas", "Comentarios", "InspectionID"
                     ],
                 )
                 st.dataframe(df, use_container_width=True, height=520)
 
                 st.download_button(
-                    "⬇️ Descargar CSV (detalle por activo)",
+                    "⬇️ Descargar CSV (detalle por equipo)",
                     data=df.drop(columns=["InspectionID"]).to_csv(index=False).encode("utf-8"),
-                    file_name=f"detalle_activos_{from_d.strftime('%Y%m%d')}_{to_d.strftime('%Y%m%d')}.csv",
+                    file_name=f"detalle_equipos_{from_d.strftime('%Y%m%d')}_{to_d.strftime('%Y%m%d')}.csv",
                     mime="text/csv",
                 )
 
