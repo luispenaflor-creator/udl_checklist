@@ -26,16 +26,25 @@ CAMPUSES = [
     "Medellin",
 ]
 
+# 👇 Activos “vigentes” (los que sí quieres)
 ASSETS = [
     ("Laptop", 1),
     ("Pantalla", 2),
     ("Control remoto", 3),
     ("Cable HDMI", 4),
     ("Pedestal", 5),
-    ("Conector HDMI en el pedestal", 6),
-    ("Baterias del control remoto", 7),
     ("Microfono USB", 8),
 ]
+
+# 👇 Activos que NO deben mostrarse (aunque existan en DB por histórico)
+HIDDEN_ASSETS = {
+    "Baterias del control remoto",
+    "Baterias de control",
+    "Baterías del control remoto",
+    "Conector HDMI pedestal",
+    "Conector HDMI en pedestal",
+    "Conector HDMI en el pedestal",
+}
 
 ROOMS_BY_CAMPUS = {
     "Luis Cabrera": [f"Salon {i:02d}" for i in range(1, 25)] + ["Lab PA", "Lab PB"],
@@ -60,12 +69,9 @@ ROOMS_BY_CAMPUS = {
 # =========================
 # ESTATUS (UI) + MAPEOS A DB
 # =========================
-# Vigilantes: solo 3 opciones
 STATUS_UI_GUARD = ["OK", "FALTA", "DAÑADO / NO FUNCIONA"]
-# Admin: incluye N_A para registros viejos (si existen)
 STATUS_UI_ADMIN = ["OK", "FALTA", "DAÑADO / NO FUNCIONA", "N_A"]
 
-# En la base existe un CHECK antiguo con estos valores (NO los rompemos)
 STATUS_DB_ALLOWED = [
     "OK",
     "FALTA_REPOSICION",
@@ -85,11 +91,9 @@ def ui_to_db_status(ui_status: str) -> str:
     if ui_status == "FALTA":
         return "FALTA_REPOSICION"
     if ui_status == "DAÑADO / NO FUNCIONA":
-        # agrupamos todo lo dañado/no funciona en un solo estatus válido en DB
         return "NO_FUNCIONA_MANTENIMIENTO"
     if ui_status == "N_A":
         return "N_A"
-    # fallback seguro
     return "NO_FUNCIONA_MANTENIMIENTO"
 
 
@@ -109,7 +113,6 @@ def db_to_ui_status(db_status: str) -> str:
         "DANADO_MANTENIMIENTO",
     ):
         return "DAÑADO / NO FUNCIONA"
-    # si aparece algo raro, lo mostramos como dañado para no romper UI
     return "DAÑADO / NO FUNCIONA"
 
 
@@ -365,6 +368,7 @@ def ensure_db_setup(client):
         for c in CAMPUSES:
             client.execute("INSERT OR IGNORE INTO campuses(name) VALUES (?)", [c])
 
+        # Solo se insertan los activos vigentes (no insertamos los ocultos)
         for name, order in ASSETS:
             client.execute("INSERT OR IGNORE INTO asset_types(name, sort_order) VALUES (?, ?)", [name, order])
 
@@ -561,15 +565,19 @@ def cached_campus_id(campus_name: str):
 
 @st.cache_data(ttl=900)
 def cached_assets():
+    # Dedup + EXCLUSIÓN de activos ocultos para NO mostrarlos en UI
+    hidden = sorted(list(HIDDEN_ASSETS))
+    placeholders = ",".join(["?"] * len(hidden))
     return fetch_all(
         CLIENT,
-        """
+        f"""
         SELECT MIN(id) as id, name
         FROM asset_types
+        WHERE name NOT IN ({placeholders})
         GROUP BY name
         ORDER BY MIN(sort_order), name
         """,
-        [],
+        hidden,
     )
 
 
@@ -627,7 +635,7 @@ def registro_enviado_dialog(resumen: str):
 
 
 # =========================
-# EDITAR / ELIMINAR REVISIONES (admin/usuarios)
+# EDITAR / ELIMINAR REVISIONES
 # =========================
 def get_inspection_header(ins_id: str):
     return fetch_one(
@@ -644,16 +652,20 @@ def get_inspection_header(ins_id: str):
 
 
 def get_inspection_items(ins_id: str):
+    # OJO: ocultamos también activos “hidden” en la edición, para que no salgan
+    hidden = sorted(list(HIDDEN_ASSETS))
+    placeholders = ",".join(["?"] * len(hidden))
     return fetch_all(
         CLIENT,
-        """
+        f"""
         SELECT a.id as asset_type_id, a.name, it.status, COALESCE(it.notes,'')
         FROM inspection_items it
         JOIN asset_types a ON a.id = it.asset_type_id
         WHERE it.inspection_id = ?
+          AND a.name NOT IN ({placeholders})
         ORDER BY a.sort_order, a.name
         """,
-        [ins_id],
+        [ins_id] + hidden,
     )
 
 
@@ -752,19 +764,20 @@ migrate_legacy_admin_to_users(CLIENT)
 admin_first_run_setup(CLIENT)
 admin_login_sidebar(CLIENT)
 
-# Tabs: para vigilantes agregamos una pestaña "Salones registrados"
 if is_logged():
-    tab_new, tab_rooms, tab_query, tab_users = st.tabs(["📝 Nueva revisión", "✅ Salones registrados", "🔎 Consultas", "👥 Usuarios"])
+    tab_new, tab_rooms, tab_query, tab_users = st.tabs(
+        ["📝 Nueva revisión", "✅ Salones registrados", "🔎 Consultas", "👥 Usuarios"]
+    )
 else:
     tab_new, tab_rooms = st.tabs(["📝 Nueva revisión", "✅ Salones registrados"])
 
 
 # =========================
-# TAB: SALONES REGISTRADOS (vigilantes)
+# TAB: SALONES REGISTRADOS (cards)
 # =========================
 with tab_rooms:
-    st.subheader("✅ Salones registrados hoy (solo lista)")
-    st.caption("Selecciona tu plantel y verás qué salones/áreas ya quedaron registrados hoy. No muestra detalle.")
+    st.subheader("✅ Salones registrados hoy")
+    st.caption("Selecciona tu plantel y verás qué salones/áreas ya quedaron registrados hoy (solo lista).")
 
     campus_v = st.selectbox("Plantel", ["(Selecciona...)"] + CAMPUSES, index=0, key="campus_view_registered")
     if campus_v == "(Selecciona...)":
@@ -787,12 +800,27 @@ with tab_rooms:
         )
         registered_list = [r[0] for r in reg_rooms] if reg_rooms else []
 
-        st.write(f"Fecha: **{inspected_on_str}**")
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.metric("Fecha", inspected_on_str)
+        with c2:
+            st.metric("Registrados", str(len(registered_list)))
+
         if not registered_list:
             st.info("Aún no hay salones registrados hoy en este plantel.")
         else:
-            st.success(f"Registrados: {len(registered_list)}")
-            st.write(" • " + "  |  ".join(registered_list))
+            st.markdown("### Lista de salones/áreas (registrados)")
+            # Grid visual en recuadros
+            cols_per_row = 4
+            cols = st.columns(cols_per_row)
+            for i, room_code in enumerate(registered_list):
+                with cols[i % cols_per_row]:
+                    with st.container(border=True):
+                        st.markdown(
+                            f"<div style='text-align:center; font-size:18px; font-weight:700; padding:6px 0;'>"
+                            f"{room_code}</div>",
+                            unsafe_allow_html=True,
+                        )
 
 
 # =========================
@@ -934,7 +962,6 @@ with tab_new:
                 )
                 st.stop()
 
-            # Insert items (convertimos UI -> DB para no romper el CHECK existente)
             try:
                 for asset_type_id, _, status_ui, note in items_payload:
                     db_status = ui_to_db_status(status_ui)
@@ -951,7 +978,6 @@ with tab_new:
                         ],
                     )
             except Exception as e:
-                # Si algo falló, borramos la inspección para no dejarla a medias
                 try:
                     CLIENT.execute("DELETE FROM inspections WHERE id = ?", [inspection_id])
                 except Exception:
@@ -1022,6 +1048,7 @@ if is_logged():
             room_codes = [r[1] for r in rooms]
             room_q = st.selectbox("Salón / Área", ["(Todos)"] + room_codes, index=0, key="room_q")
 
+        # activos visibles
         asset_rows = cached_assets()
         asset_names = [r[1] for r in asset_rows]
         activo_q = st.multiselect(
@@ -1075,6 +1102,9 @@ if is_logged():
             if only_incidencias:
                 status_where = " AND it.status NOT IN ('OK','N_A')"
 
+            hidden = sorted(list(HIDDEN_ASSETS))
+            ph = ",".join(["?"] * len(hidden))
+
             rows2 = fetch_all(
                 CLIENT,
                 f"""
@@ -1083,12 +1113,14 @@ if is_logged():
                   COUNT(*) AS total
                 FROM inspections i
                 JOIN inspection_items it ON it.inspection_id = i.id
+                JOIN asset_types a ON a.id = it.asset_type_id
                 WHERE {where_sql}
+                  AND a.name NOT IN ({ph})
                   {status_where}
                 GROUP BY it.status
                 ORDER BY total DESC
                 """,
-                args,
+                args + hidden,
             )
             df_st = pd.DataFrame(rows2, columns=["StatusDB", "Total"]) if rows2 else pd.DataFrame(columns=["StatusDB", "Total"])
             if not df_st.empty:
@@ -1117,7 +1149,6 @@ if is_logged():
                 if df_st.empty:
                     st.info("Sin resultados.")
                 else:
-                    # agrupamos por el estatus UI
                     g = df_st.groupby("Status", as_index=False)["Total"].sum()
                     st.dataframe(g, use_container_width=True, hide_index=True)
                     st.bar_chart(g.set_index("Status"))
@@ -1142,6 +1173,9 @@ if is_logged():
             if not rows:
                 st.info("Sin resultados con los filtros actuales.")
             else:
+                hidden = sorted(list(HIDDEN_ASSETS))
+                ph = ",".join(["?"] * len(hidden))
+
                 for inspected_on, campus_name, room_code, guard_name, inspected_at, comments, ins_id in rows[:150]:
                     with st.expander(f"{inspected_on} | {campus_name} | {room_code} | {guard_name}"):
                         if inspected_at:
@@ -1151,14 +1185,15 @@ if is_logged():
 
                         items = fetch_all(
                             CLIENT,
-                            """
+                            f"""
                             SELECT a.name, it.status, it.notes
                             FROM inspection_items it
                             JOIN asset_types a ON a.id = it.asset_type_id
                             WHERE it.inspection_id = ?
+                              AND a.name NOT IN ({ph})
                             ORDER BY a.sort_order, a.name
                             """,
-                            [ins_id],
+                            [ins_id] + hidden,
                         )
 
                         if "(Todos)" not in activo_q:
@@ -1206,7 +1241,6 @@ if is_logged():
 
             if "(Todos)" not in status_filter_ui:
                 db_list = [ui_to_db_status(s) for s in status_filter_ui]
-                # dedup
                 db_list = list(dict.fromkeys(db_list))
                 placeholders = ",".join(["?"] * len(db_list))
                 extra_sql += f" AND it.status IN ({placeholders})"
@@ -1216,6 +1250,9 @@ if is_logged():
                 placeholders = ",".join(["?"] * len(activo_q))
                 extra_sql += f" AND a.name IN ({placeholders})"
                 extra_args.extend(activo_q)
+
+            hidden = sorted(list(HIDDEN_ASSETS))
+            ph = ",".join(["?"] * len(hidden))
 
             rows = fetch_all(
                 CLIENT,
@@ -1236,11 +1273,12 @@ if is_logged():
                 JOIN inspection_items it ON it.inspection_id = i.id
                 JOIN asset_types a ON a.id = it.asset_type_id
                 WHERE {where_sql}
+                  AND a.name NOT IN ({ph})
                   {extra_sql}
                 ORDER BY i.inspected_on DESC, c.name, r.room_code, a.sort_order
                 LIMIT 4000
                 """,
-                extra_args,
+                extra_args + hidden,
             )
 
             if not rows:
@@ -1431,4 +1469,3 @@ if is_logged():
                                 st.rerun()
                         except Exception as e:
                             st.error(f"No se pudo resetear: {e}")
-
