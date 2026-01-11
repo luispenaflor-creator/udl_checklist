@@ -606,14 +606,14 @@ items_payload.append((asset_id, asset_name, status, cond, note))
 
 submitted = st.form_submit_button("Guardar revisión")
 
-        if submitted:
-            if not (guard_name or "").strip():
-                st.error("Falta el nombre del vigilante.")
-                st.stop()
+            if submitted:
+                if not (guard_name or "").strip():
+                    st.error("Falta el nombre del vigilante.")
+                    st.stop()
 
-            if not room_code or room_code == "(Selecciona...)":
-                st.error("Selecciona un salón/área o agrega uno nuevo.")
-                st.stop()
+                if not room_code or room_code == "(Selecciona...)":
+                    st.error("Selecciona un salón/área o agrega uno nuevo.")
+                    st.stop()
 
 # Forzar condición a N_A cuando el estatus es N_A
 items_payload = [
@@ -863,6 +863,7 @@ if is_admin():
             )
         else:
             st.info("Sin incidencias en ese rango.")
+
 
 
 
