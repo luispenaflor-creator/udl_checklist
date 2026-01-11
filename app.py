@@ -79,7 +79,7 @@ def get_secret(key: str, default=None):
 
 
 # =========================
-# TURSO HTTP CLIENT (robusto)
+# TURSO HTTP CLIENT
 # =========================
 class TursoHTTPClient:
     def __init__(self, base_url: str, token: str, timeout: int = 45, retries: int = 6):
@@ -209,7 +209,7 @@ def fetch_all(client, sql, args=None):
 
 
 # =========================
-# SCHEMA + SETTINGS
+# SCHEMA
 # =========================
 def init_db(client):
     schema = """
@@ -338,7 +338,7 @@ def ensure_db_setup(client):
 
 
 # =========================
-# USERS (multi-admin) + MIGRACIÓN desde app_settings
+# USERS
 # =========================
 def user_count(client) -> int:
     row = fetch_one(client, "SELECT COUNT(*) FROM users", [])
@@ -542,6 +542,9 @@ def track_campus_change(campus_value: str):
     prev = st.session_state.get("campus_prev")
     if prev != campus_value:
         st.session_state["campus_prev"] = campus_value
+        # limpiar selección de salón y nuevo salón al cambiar plantel
+        st.session_state["room_choice"] = "(Selecciona...)"
+        st.session_state["new_room_code"] = ""
         new_form_nonce()
 
 
@@ -550,13 +553,15 @@ def registro_enviado_dialog(resumen: str):
     st.success("Tu registro fue enviado correctamente.")
     st.write(resumen)
     if st.button("Aceptar / Nuevo registro", type="primary"):
+        st.session_state["room_choice"] = "(Selecciona...)"
+        st.session_state["new_room_code"] = ""
         new_form_nonce()
         st.session_state["show_sent_dialog"] = False
         st.rerun()
 
 
 # =========================
-# EDITAR / ELIMINAR REVISIONES (para usuarios logueados)
+# EDITAR / ELIMINAR REVISIONES
 # =========================
 def get_inspection_header(ins_id: str):
     return fetch_one(
@@ -586,7 +591,7 @@ def get_inspection_items(ins_id: str):
     )
 
 
-@st.dialog("✏️ Editar revisión")
+@st.dialog("✏️ Editar / Eliminar revisión")
 def edit_inspection_dialog(ins_id: str):
     hdr = get_inspection_header(ins_id)
     if not hdr:
@@ -622,11 +627,12 @@ def edit_inspection_dialog(ins_id: str):
                 st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=k_cond)
                 cond_val = "N_A"
             else:
-                default_cond = cond if cond in ["BUENO", "REGULAR", "MALO"] else "BUENO"
+                opts = ["BUENO", "REGULAR", "MALO"]
+                default_cond = cond if cond in opts else "BUENO"
                 cond_val = st.selectbox(
                     "Condición",
-                    ["BUENO", "REGULAR", "MALO"],
-                    index=["BUENO", "REGULAR", "MALO"].index(default_cond),
+                    opts,
+                    index=opts.index(default_cond),
                     key=k_cond,
                 )
 
@@ -663,6 +669,8 @@ def edit_inspection_dialog(ins_id: str):
                 )
 
             st.success("✅ Cambios guardados.")
+            st.session_state["open_edit_dialog"] = False
+            st.session_state["edit_target"] = None
             st.rerun()
 
     with c2:
@@ -671,6 +679,8 @@ def edit_inspection_dialog(ins_id: str):
         if st.button("🗑️ Eliminar revisión", disabled=not confirm):
             CLIENT.execute("DELETE FROM inspections WHERE id = ?", [ins_id])
             st.success("✅ Revisión eliminada.")
+            st.session_state["open_edit_dialog"] = False
+            st.session_state["edit_target"] = None
             st.rerun()
 
 
@@ -716,44 +726,45 @@ with tab_new:
     if campus != "(Selecciona...)":
         track_campus_change(campus)
 
-    # IMPORTANTE: NO usamos st.stop() aquí para no bloquear Consultas
+    # IMPORTANTE: NO st.stop() aquí (para no bloquear Consultas)
     if campus == "(Selecciona...)":
         st.info("Selecciona un plantel para iniciar un registro.")
     else:
         campus_id = cached_campus_id(campus)
         today_mx = datetime.now(TZ_MX).date()
         inspected_on_str = today_mx.strftime("%Y-%m-%d")
+
+        # ✅ Selector de salón FUERA del form (para que el input de "nuevo salón" aparezca al instante)
+        rooms = get_rooms_for_campus(campus_id)
+        room_map = {r[1]: int(r[0]) for r in rooms}
+        room_options = ["(Selecciona...)"] + list(room_map.keys()) + ["(Agregar nuevo...)"]
+
+        cA, cB, cC = st.columns(3)
+        with cA:
+            st.text_input("Fecha (automática)", value=inspected_on_str, disabled=True)
+        with cB:
+            choice = st.selectbox("Salón / Área", room_options, index=0, key="room_choice")
+        with cC:
+            guard_name_out = st.text_input("Nombre del vigilante (obligatorio)", key="guard_name_out")
+
+        room_id = None
+        room_code = None
+
+        if choice == "(Agregar nuevo...)":
+            new_room = st.text_input("Escribe el salón/área nuevo", key="new_room_code", placeholder="Ej. Salon 01 / Laboratorio / Auditorio")
+            new_room = " ".join((new_room or "").strip().split())
+            if new_room:
+                room_code = new_room
+        elif choice != "(Selecciona...)":
+            room_code = choice
+            room_id = room_map.get(choice)
+
+        comments_out = st.text_area("Comentarios generales (opcional)", key="comments_out")
+
         nonce = current_nonce()
 
+        # ✅ El checklist y el submit quedan en FORM (esto sí debe ir en form)
         with st.form(f"new_inspection_form_{nonce}", clear_on_submit=False):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.text_input("Fecha (automática)", value=inspected_on_str, disabled=True)
-
-            with c2:
-                rooms = get_rooms_for_campus(campus_id)
-                room_map = {r[1]: int(r[0]) for r in rooms}
-                # ✅ permitir agregar manualmente salones en cualquier plantel (incl. Medellin)
-                options = ["(Selecciona...)"] + list(room_map.keys()) + ["(Agregar nuevo...)"]
-                choice = st.selectbox("Salón / Área", options, index=0, key=f"room_sel_{nonce}")
-
-            with c3:
-                guard_name = st.text_input("Nombre del vigilante (obligatorio)", key=f"guard_{nonce}")
-
-            room_id = None
-            room_code = None
-            new_room_code = None
-
-            if choice == "(Agregar nuevo...)":
-                new_room_code = st.text_input("Nombre del salón/área (nuevo)", key=f"new_room_{nonce}")
-                new_room_code = " ".join((new_room_code or "").strip().split())
-                room_code = new_room_code if new_room_code else None
-            elif choice != "(Selecciona...)":
-                room_code = choice
-                room_id = room_map.get(choice)
-
-            comments = st.text_area("Comentarios generales (opcional)", key=f"comments_{nonce}")
-
             st.markdown("### Checklist de activos")
             st.caption("Selecciona estatus y condición por cada activo (obligatorio).")
 
@@ -776,7 +787,6 @@ with tab_new:
                         key=status_key,
                     )
 
-                    # ✅ NA => Condición NA automática (UI)
                     if status == "N_A":
                         st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=cond_key)
                         cond = "N_A"
@@ -793,98 +803,98 @@ with tab_new:
 
             submitted = st.form_submit_button("Guardar revisión")
 
-            if submitted:
-                if not (guard_name or "").strip():
-                    st.error("Falta el nombre del vigilante.")
-                    st.stop()
+        if submitted:
+            if not (guard_name_out or "").strip():
+                st.error("Falta el nombre del vigilante.")
+                st.stop()
 
-                if not room_code or room_code == "(Selecciona...)":
-                    st.error("Selecciona un salón/área o agrega uno nuevo.")
-                    st.stop()
+            if not room_code:
+                st.error("Selecciona un salón/área o agrega uno nuevo.")
+                st.stop()
 
-                # ✅ NA => Condición NA automática (guardado)
-                items_payload = [
-                    (asset_type_id, asset_name, status, ("N_A" if status == "N_A" else cond), note)
-                    for (asset_type_id, asset_name, status, cond, note) in items_payload
-                ]
+            # NA => Condición NA
+            items_payload = [
+                (asset_type_id, asset_name, status, ("N_A" if status == "N_A" else cond), note)
+                for (asset_type_id, asset_name, status, cond, note) in items_payload
+            ]
 
-                for _, asset_name, status, cond, _ in items_payload:
-                    if status == "(Selecciona...)":
-                        missing.append(asset_name)
-                    elif status != "N_A" and cond == "(Selecciona...)":
-                        missing.append(asset_name)
+            for _, asset_name, status, cond, _ in items_payload:
+                if status == "(Selecciona...)":
+                    missing.append(asset_name)
+                elif status != "N_A" and cond == "(Selecciona...)":
+                    missing.append(asset_name)
 
-                if missing:
-                    st.error("Faltan seleccionar estatus/condición en: " + ", ".join(missing))
-                    st.stop()
+            if missing:
+                st.error("Faltan seleccionar estatus/condición en: " + ", ".join(missing))
+                st.stop()
 
-                # ✅ si es nuevo salón: insert + obtener id
-                if choice == "(Agregar nuevo...)":
-                    CLIENT.execute(
-                        "INSERT OR IGNORE INTO rooms(campus_id, room_code) VALUES (?, ?)",
-                        [campus_id, room_code],
-                    )
-                    invalidate_rooms_cache(campus_id)
-                    row = fetch_one(
-                        CLIENT,
-                        "SELECT id FROM rooms WHERE campus_id=? AND room_code=?",
-                        [campus_id, room_code],
-                    )
-                    room_id = int(row[0]) if row else None
-
-                if not room_id:
-                    st.error("No se pudo resolver el salón. Intenta de nuevo.")
-                    st.stop()
-
-                inspection_id = str(uuid.uuid4())
-                inspected_at_str = datetime.now(TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
-
-                try:
-                    CLIENT.execute(
-                        """
-                        INSERT INTO inspections(id, campus_id, room_id, guard_name, inspected_on, inspected_at, comments)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        [
-                            inspection_id,
-                            campus_id,
-                            room_id,
-                            guard_name.strip(),
-                            inspected_on_str,
-                            inspected_at_str,
-                            (comments or "").strip() or None,
-                        ],
-                    )
-                except Exception:
-                    st.error(
-                        f"⚠️ Ya existe una revisión para **{campus} / {room_code}** en **{inspected_on_str}**.\n\n"
-                        "No se puede guardar dos veces el mismo salón el mismo día."
-                    )
-                    st.stop()
-
-                for asset_type_id, _, status, cond, note in items_payload:
-                    CLIENT.execute(
-                        """
-                        INSERT INTO inspection_items(inspection_id, asset_type_id, status, condition, notes)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        [
-                            inspection_id,
-                            asset_type_id,
-                            status,
-                            cond,
-                            (note or "").strip() or None,
-                        ],
-                    )
-
-                st.session_state["sent_summary"] = (
-                    f"Plantel: **{campus}**\n\n"
-                    f"Salón/Área: **{room_code}**\n\n"
-                    f"Vigilante: **{guard_name.strip()}**\n\n"
-                    f"Fecha: **{inspected_on_str}**"
+            # Crear salón si es nuevo (esto ahora sí funciona para Medellín y cualquiera)
+            if choice == "(Agregar nuevo...)":
+                CLIENT.execute(
+                    "INSERT OR IGNORE INTO rooms(campus_id, room_code) VALUES (?, ?)",
+                    [campus_id, room_code],
                 )
-                st.session_state["show_sent_dialog"] = True
-                st.rerun()
+                invalidate_rooms_cache(campus_id)
+                row = fetch_one(
+                    CLIENT,
+                    "SELECT id FROM rooms WHERE campus_id=? AND room_code=?",
+                    [campus_id, room_code],
+                )
+                room_id = int(row[0]) if row else None
+
+            if not room_id:
+                st.error("No se pudo resolver el salón. Intenta de nuevo.")
+                st.stop()
+
+            inspection_id = str(uuid.uuid4())
+            inspected_at_str = datetime.now(TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
+
+            try:
+                CLIENT.execute(
+                    """
+                    INSERT INTO inspections(id, campus_id, room_id, guard_name, inspected_on, inspected_at, comments)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        inspection_id,
+                        campus_id,
+                        room_id,
+                        guard_name_out.strip(),
+                        inspected_on_str,
+                        inspected_at_str,
+                        (comments_out or "").strip() or None,
+                    ],
+                )
+            except Exception:
+                st.error(
+                    f"⚠️ Ya existe una revisión para **{campus} / {room_code}** en **{inspected_on_str}**.\n\n"
+                    "No se puede guardar dos veces el mismo salón el mismo día."
+                )
+                st.stop()
+
+            for asset_type_id, _, status, cond, note in items_payload:
+                CLIENT.execute(
+                    """
+                    INSERT INTO inspection_items(inspection_id, asset_type_id, status, condition, notes)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        inspection_id,
+                        asset_type_id,
+                        status,
+                        cond,
+                        (note or "").strip() or None,
+                    ],
+                )
+
+            st.session_state["sent_summary"] = (
+                f"Plantel: **{campus}**\n\n"
+                f"Salón/Área: **{room_code}**\n\n"
+                f"Vigilante: **{guard_name_out.strip()}**\n\n"
+                f"Fecha: **{inspected_on_str}**"
+            )
+            st.session_state["show_sent_dialog"] = True
+            st.rerun()
 
 
 # =========================
@@ -939,10 +949,15 @@ if is_logged():
             room_codes = [r[1] for r in rooms]
             room_q = st.selectbox("Salón / Área", ["(Todos)"] + room_codes, index=0, key="room_q")
 
-        # ✅ Filtro de activo (lo pediste)
+        # filtro de activo
         asset_rows = cached_assets()
-        asset_names = [r[1] for r in asset_rows]  # [(id,name),...]
-        activo_q = st.multiselect("Filtrar activos (opcional)", options=["(Todos)"] + asset_names, default=["(Todos)"], key="activo_q")
+        asset_names = [r[1] for r in asset_rows]
+        activo_q = st.multiselect(
+            "Filtrar activos (opcional)",
+            options=["(Todos)"] + asset_names,
+            default=["(Todos)"],
+            key="activo_q",
+        )
 
         where = ["i.inspected_on BETWEEN ? AND ?"]
         args = [from_d.strftime("%Y-%m-%d"), to_d.strftime("%Y-%m-%d")]
@@ -984,7 +999,6 @@ if is_logged():
                 columns=["Fecha", "Plantel", "Revisiones"]
             )
 
-            # FIX: Turso puede devolver números como string -> forzamos numérico
             if not df_rev.empty:
                 df_rev["Revisiones"] = pd.to_numeric(df_rev["Revisiones"], errors="coerce").fillna(0).astype(int)
 
@@ -999,9 +1013,7 @@ if is_logged():
                   it.status AS status,
                   COUNT(*) AS total
                 FROM inspections i
-                JOIN rooms r ON r.id = i.room_id
                 JOIN inspection_items it ON it.inspection_id = i.id
-                JOIN asset_types a ON a.id = it.asset_type_id
                 WHERE {where_sql}
                   {status_where}
                 GROUP BY it.status
@@ -1012,14 +1024,6 @@ if is_logged():
             df_st = pd.DataFrame(rows2, columns=["Status", "Total"]) if rows2 else pd.DataFrame(columns=["Status", "Total"])
             if not df_st.empty:
                 df_st["Total"] = pd.to_numeric(df_st["Total"], errors="coerce").fillna(0).astype(int)
-
-            m1, m2, m3 = st.columns(3)
-            with m1:
-                st.metric("Días en rango", (to_d - from_d).days + 1)
-            with m2:
-                st.metric("Revisiones (total)", int(df_rev["Revisiones"].sum()) if not df_rev.empty else 0)
-            with m3:
-                st.metric("Items (total)", int(df_st["Total"].sum()) if not df_st.empty else 0)
 
             c1, c2 = st.columns([2, 1])
             with c1:
@@ -1046,7 +1050,7 @@ if is_logged():
                     st.bar_chart(df_st.set_index("Status"))
 
         elif view_mode == "Detalle por revisión":
-            st.markdown("### Detalle por revisión (con editar/eliminar)")
+            st.markdown("### Detalle por revisión (Editar/Eliminar)")
 
             rows = fetch_all(
                 CLIENT,
@@ -1067,14 +1071,13 @@ if is_logged():
             if not rows:
                 st.info("Sin resultados con los filtros actuales.")
             else:
-                for inspected_on, campus_name, room_code, guard_name, inspected_at, comments, ins_id in rows[:120]:
+                for inspected_on, campus_name, room_code, guard_name, inspected_at, comments, ins_id in rows[:150]:
                     with st.expander(f"{inspected_on} | {campus_name} | {room_code} | {guard_name}"):
                         if inspected_at:
                             st.caption(f"Registrado: {inspected_at}")
                         if comments:
                             st.info(f"Comentarios: {comments}")
 
-                        # Items + filtros de activo/incidencias
                         items = fetch_all(
                             CLIENT,
                             """
@@ -1087,9 +1090,9 @@ if is_logged():
                             [ins_id],
                         )
 
+                        # filtros
                         if "(Todos)" not in activo_q:
                             items = [x for x in items if x[0] in activo_q]
-
                         if only_incidencias:
                             items = [x for x in items if x[1] not in ("OK", "N_A")]
 
@@ -1099,14 +1102,22 @@ if is_logged():
                             for a_name, stt, cond, note in items:
                                 st.write(f"- **{a_name}**: {stt} / {cond}" + (f" — {note}" if note else ""))
 
-                        st.divider()
+                        # ✅ Botones confiables (por session_state)
                         b1, b2 = st.columns(2)
                         with b1:
                             if st.button("✏️ Editar", key=f"btn_edit_{ins_id}"):
-                                edit_inspection_dialog(ins_id)
+                                st.session_state["edit_target"] = ins_id
+                                st.session_state["open_edit_dialog"] = True
+                                st.rerun()
                         with b2:
                             if st.button("🗑️ Eliminar", key=f"btn_del_{ins_id}"):
-                                edit_inspection_dialog(ins_id)
+                                st.session_state["edit_target"] = ins_id
+                                st.session_state["open_edit_dialog"] = True
+                                st.rerun()
+
+                # abrir dialog al final (fuera del loop)
+                if st.session_state.get("open_edit_dialog") and st.session_state.get("edit_target"):
+                    edit_inspection_dialog(st.session_state["edit_target"])
 
         else:
             st.markdown("### Detalle por activo (tabla)")
@@ -1156,7 +1167,7 @@ if is_logged():
                 WHERE {where_sql}
                   {extra_sql}
                 ORDER BY i.inspected_on DESC, c.name, r.room_code, a.sort_order
-                LIMIT 2000
+                LIMIT 4000
                 """,
                 extra_args,
             )
@@ -1171,16 +1182,7 @@ if is_logged():
                         "Status/Accion", "Condicion", "Notas", "Comentarios", "InspectionID"
                     ],
                 )
-
-                k1, k2, k3 = st.columns(3)
-                with k1:
-                    st.metric("Items", len(df))
-                with k2:
-                    st.metric("Revisiones únicas", df[["Fecha", "Plantel", "Salon", "InspectionID"]].drop_duplicates().shape[0])
-                with k3:
-                    st.metric("Vigilantes", df["Vigilante"].nunique())
-
-                st.dataframe(df, use_container_width=True, height=450)
+                st.dataframe(df, use_container_width=True, height=520)
 
                 st.download_button(
                     "⬇️ Descargar CSV (detalle por activo)",
@@ -1260,4 +1262,3 @@ if is_logged() and is_admin():
             user_delete(CLIENT, picked_id2)
             st.success("✅ Usuario eliminado.")
             st.rerun()
-
