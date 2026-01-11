@@ -701,16 +701,12 @@ migrate_legacy_admin_to_users(CLIENT)
 admin_first_run_setup(CLIENT)
 admin_login_sidebar(CLIENT)
 
-# ✅ OBLIGAR LOGIN para usar la app
-if not is_logged():
-    st.info("Inicia sesión para acceder a Consultas.")
-    st.stop()
 
 # ✅ Tabs según rol
-if is_admin():
+if is_logged():
     tab_new, tab_query = st.tabs(["📝 Nueva revisión", "🔎 Consultas"])
 else:
-    tab_query, = st.tabs(["🔎 Consultas"])
+    tab_new, = st.tabs(["📝 Nueva revisión"])
 
 
 # =========================
@@ -878,8 +874,12 @@ if is_admin():
 # =========================
 # TAB: CONSULTAS (todos los usuarios logueados)
 # =========================
-with tab_query:
-    st.subheader("Consultas (dinámicas y visuales)")
+if is_logged():
+    with tab_query:
+        st.subheader("Consultas (dinámicas y visuales)")
+else:
+    # (opcional) si quieres mostrar un aviso dentro de Nueva revisión:
+    pass
 
     today_mx = datetime.now(TZ_MX).date()
     preset = st.selectbox(
@@ -1216,4 +1216,5 @@ if is_admin():
             user_delete(CLIENT, picked_id2)
             st.success("✅ Usuario eliminado.")
             st.rerun()
+
 
