@@ -586,27 +586,23 @@ with tab_new:
                     "Estatus/Acción",
                     ["(Selecciona...)"] + STATUS_OPTIONS,
                     index=0,
-                    key=status_key,
-                    on_change=on_status_change,
-                    args=(status_key, cond_key),
+                    key=f"status_{nonce}_{asset_id}",
                 )
 
-# Fuerza el valor en session_state cuando está en N_A
-        if st.session_state.get(status_key) == "N_A":
-            st.session_state[cond_key] = "N_A"
-            cond = st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=cond_key)
-        else:
-            cond = st.selectbox(
-                "Condición",
-                ["(Selecciona...)"] + COND_OPTIONS,
-                index=0,
-                key=cond_key,
-            )
+            if status == "N_A":
+                cond = st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=f"cond_{nonce}_{asset_id}")
+            else:
+                cond = st.selectbox(
+                    "Condición",
+                    ["(Selecciona...)"] + COND_OPTIONS,
+                    index=0,
+                    key=f"cond_{nonce}_{asset_id}",
+                )
 
+note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
 
-        note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
+items_payload.append((asset_id, asset_name, status, cond, note))
 
-        items_payload.append((asset_id, asset_name, status, cond, note))
 
         submitted = st.form_submit_button("Guardar revisión")
 
@@ -619,10 +615,16 @@ with tab_new:
                 st.error("Selecciona un salón/área o agrega uno nuevo.")
                 st.stop()
 
+# Forzar condición a N_A cuando el estatus es N_A
+items_payload = [
+    (asset_type_id, asset_name, status, ("N_A" if status == "N_A" else cond), note)
+    for (asset_type_id, asset_name, status, cond, note) in items_payload
+]
+            
             for _, asset_name, status, cond, _ in items_payload:
                 if status == "(Selecciona...)":
                     missing.append(asset_name)
-                elif cond == "(Selecciona...)" and status != "N_A":
+                elif status != "N_A" and cond == "(Selecciona...)":
                     missing.append(asset_name)
 
             if missing:
@@ -861,5 +863,6 @@ if is_admin():
             )
         else:
             st.info("Sin incidencias en ese rango.")
+
 
 
