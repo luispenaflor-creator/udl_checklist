@@ -1,4 +1,4 @@
-# app.py (SIN FOTOS) - versión estable
+# app.py (SIN FOTOS) - versión estable (Turso) - CORREGIDO
 
 import os
 import uuid
@@ -121,7 +121,7 @@ class TursoHTTPClient:
         args = args or []
         payload = {
             "requests": [
-                {"type": "execute", "stmt": {"sql": sql, "args": [self._arg(a) for a in args]}},
+                {"type": "execute", "stmt": {"sql": sql, "args": [self._arg(a) for a in args]}}},
                 {"type": "close"},
             ]
         }
@@ -308,7 +308,6 @@ def ensure_db_setup(client):
         init_db(client)
         st.session_state["_schema_ok"] = True
 
-    # Seed SOLO una vez (rápido)
     if settings_get(client, "seed_done_v3") != "1":
         for c in CAMPUSES:
             client.execute("INSERT OR IGNORE INTO campuses(name) VALUES (?)", [c])
@@ -507,15 +506,6 @@ admin_login_sidebar(CLIENT)
 
 tab_new, tab_query = st.tabs(["📝 Nueva revisión", "🔎 Consultas"])
 
-def on_status_change(status_key: str, cond_key: str):
-    """Si Estatus es N_A => Condición se fuerza a N_A. Si deja de ser N_A, se resetea si estaba en N_A."""
-    stt = st.session_state.get(status_key)
-    if stt == "N_A":
-        st.session_state[cond_key] = "N_A"
-    else:
-        # Si venía de N_A, obligamos a elegir de nuevo
-        if st.session_state.get(cond_key) == "N_A":
-            st.session_state[cond_key] = "(Selecciona...)"
 
 # =========================
 # TAB: NUEVA REVISION
@@ -538,7 +528,6 @@ with tab_new:
     campus_id = cached_campus_id(campus)
     today_mx = datetime.now(TZ_MX).date()
     inspected_on_str = today_mx.strftime("%Y-%m-%d")
-    inspected_at_str = datetime.now(TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
 
     nonce = current_nonce()
 
@@ -549,19 +538,14 @@ with tab_new:
         with c2:
             rooms = get_rooms_for_campus(campus_id)
             room_map = {r[1]: int(r[0]) for r in rooms}
-            options = ["(Selecciona...)"] + list(room_map.keys()) + ["(Agregar nuevo...)"]
+            options = ["(Selecciona...)"] + list(room_map.keys())
             choice = st.selectbox("Salón / Área", options, index=0, key=f"room_sel_{nonce}")
         with c3:
             guard_name = st.text_input("Nombre del vigilante (obligatorio)", key=f"guard_{nonce}")
 
         room_id = None
         room_code = None
-        if choice == "(Agregar nuevo...)":
-            new_room = st.text_input("Nombre del salón/área (nuevo)", key=f"new_room_{nonce}")
-            new_room = " ".join((new_room or "").strip().split())
-            if new_room:
-                room_code = new_room
-        elif choice != "(Selecciona...)":
+        if choice != "(Selecciona...)":
             room_code = choice
             room_id = room_map.get(choice)
 
@@ -580,47 +564,48 @@ with tab_new:
                 st.markdown(f"**{asset_name}**")
 
                 status_key = f"status_{nonce}_{asset_id}"
-                cond_key   = f"cond_{nonce}_{asset_id}"
+                cond_key = f"cond_{nonce}_{asset_id}"
 
                 status = st.selectbox(
                     "Estatus/Acción",
                     ["(Selecciona...)"] + STATUS_OPTIONS,
                     index=0,
-                    key=f"status_{nonce}_{asset_id}",
+                    key=status_key,
                 )
 
-            if status == "N_A":
-                cond = st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=f"cond_{nonce}_{asset_id}")
-            else:
-                cond = st.selectbox(
-                    "Condición",
-                    ["(Selecciona...)"] + COND_OPTIONS,
-                    index=0,
-                    key=f"cond_{nonce}_{asset_id}",
-                )
+                # UI: Si es N_A, la condición se muestra fija y bloqueada
+                if status == "N_A":
+                    cond = st.selectbox("Condición", ["N_A"], index=0, disabled=True, key=cond_key)
+                else:
+                    cond = st.selectbox(
+                        "Condición",
+                        ["(Selecciona...)"] + COND_OPTIONS,
+                        index=0,
+                        key=cond_key,
+                    )
 
-note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
+                note = st.text_input("Notas (opcional)", key=f"note_{nonce}_{asset_id}")
 
-items_payload.append((asset_id, asset_name, status, cond, note))
+                items_payload.append((asset_id, asset_name, status, cond, note))
 
+        submitted = st.form_submit_button("Guardar revisión")
 
-submitted = st.form_submit_button("Guardar revisión")
+        if submitted:
+            if not (guard_name or "").strip():
+                st.error("Falta el nombre del vigilante.")
+                st.stop()
 
-            if submitted:
-                if not (guard_name or "").strip():
-                    st.error("Falta el nombre del vigilante.")
-                    st.stop()
+            if not room_code or room_code == "(Selecciona...)":
+                st.error("Selecciona un salón/área.")
+                st.stop()
 
-                if not room_code or room_code == "(Selecciona...)":
-                    st.error("Selecciona un salón/área o agrega uno nuevo.")
-                    st.stop()
+            # ✅ FORZAR: si status es N_A => condition queda N_A al guardar
+            items_payload = [
+                (asset_type_id, asset_name, status, ("N_A" if status == "N_A" else cond), note)
+                for (asset_type_id, asset_name, status, cond, note) in items_payload
+            ]
 
-# Forzar condición a N_A cuando el estatus es N_A
-items_payload = [
-    (asset_type_id, asset_name, status, ("N_A" if status == "N_A" else cond), note)
-    for (asset_type_id, asset_name, status, cond, note) in items_payload
-]
-            
+            # Validación: condición obligatoria solo si status != N_A
             for _, asset_name, status, cond, _ in items_payload:
                 if status == "(Selecciona...)":
                     missing.append(asset_name)
@@ -631,25 +616,14 @@ items_payload = [
                 st.error("Faltan seleccionar estatus/condición en: " + ", ".join(missing))
                 st.stop()
 
-            # Crear salón si es nuevo
-            if choice == "(Agregar nuevo...)":
-                CLIENT.execute(
-                    "INSERT OR IGNORE INTO rooms(campus_id, room_code) VALUES (?, ?)",
-                    [campus_id, room_code],
-                )
-                invalidate_rooms_cache(campus_id)
-                row = fetch_one(
-                    CLIENT,
-                    "SELECT id FROM rooms WHERE campus_id=? AND room_code=?",
-                    [campus_id, room_code],
-                )
-                room_id = int(row[0]) if row else None
-
             if not room_id:
                 st.error("No se pudo resolver el salón. Intenta de nuevo.")
                 st.stop()
 
             inspection_id = str(uuid.uuid4())
+
+            # ✅ Calcular hora EXACTA al guardar
+            inspected_at_str = datetime.now(TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
 
             # Insert inspección (bloquea duplicados)
             try:
@@ -711,9 +685,11 @@ with tab_query:
     with q1:
         campus_q = st.selectbox("Plantel", ["(Todos)"] + CAMPUSES, index=0, key="campus_q")
     with q2:
-        from_d = st.date_input("Desde", value=date.today().replace(day=1), key="from_d")
+        today_mx_q = datetime.now(TZ_MX).date()
+        from_d = st.date_input("Desde", value=today_mx_q.replace(day=1), key="from_d")
     with q3:
-        to_d = st.date_input("Hasta", value=date.today(), key="to_d")
+        today_mx_q2 = datetime.now(TZ_MX).date()
+        to_d = st.date_input("Hasta", value=today_mx_q2, key="to_d")
 
     where = []
     args = []
@@ -775,7 +751,8 @@ if is_admin():
         with e1:
             campus_e = st.selectbox("Plantel", CAMPUSES, key="campus_e")
         with e2:
-            day_e = st.date_input("Fecha (día)", value=date.today(), key="day_e")
+            today_mx_e = datetime.now(TZ_MX).date()
+            day_e = st.date_input("Fecha (día)", value=today_mx_e, key="day_e")
 
         campus_id_e = cached_campus_id(campus_e)
         ins_list = fetch_all(
@@ -810,9 +787,11 @@ if is_admin():
         with r1:
             campus_r = st.selectbox("Plantel", ["(Todos)"] + CAMPUSES, key="campus_r")
         with r2:
-            from_r = st.date_input("Desde", value=date.today().replace(day=1), key="from_r")
+            today_mx_r = datetime.now(TZ_MX).date()
+            from_r = st.date_input("Desde", value=today_mx_r.replace(day=1), key="from_r")
         with r3:
-            to_r = st.date_input("Hasta", value=date.today(), key="to_r")
+            today_mx_r2 = datetime.now(TZ_MX).date()
+            to_r = st.date_input("Hasta", value=today_mx_r2, key="to_r")
 
         args = [from_r.strftime("%Y-%m-%d"), to_r.strftime("%Y-%m-%d")]
         campus_filter_sql = ""
@@ -863,8 +842,3 @@ if is_admin():
             )
         else:
             st.info("Sin incidencias en ese rango.")
-
-
-
-
-
