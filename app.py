@@ -24,6 +24,7 @@ CAMPUSES = [
     "San Luis",
     "Orizaba",
     "Medellin",
+    "Vertiz",
 ]
 
 # 👇 Activos “vigentes” (los que sí quieres)
@@ -62,6 +63,12 @@ ROOMS_BY_CAMPUS = {
         + ["Lab Computo"]
         + [f"Taller Costura {i}" for i in range(1, 6)]
         + ["Taller Estampado", "Salon Dibujo"]
+    ),
+    "Vertiz": (
+        [f"Salon {i:02d}" for i in range(1, 47)]
+        + ["Caja Negra Grande", "Caja Negra Chica"]
+        + [f"Cocina {i}" for i in range(1, 9)]
+        + ["Maridaje", "Laboratorio de redes", "Laboratorio 4", "Laboratorio 5", "Laboratorio de Psicologia"]
     ),
     "Medellin": [],
 }
@@ -384,6 +391,21 @@ def ensure_db_setup(client):
                 )
 
         settings_set(client, "seed_done_v3", "1")
+
+    # 🔁 Migración: agregar Vertiz (y sus salones) aunque seed_done_v3 ya exista
+    if settings_get(client, "seed_done_v4_vertiz") != "1":
+        client.execute("INSERT OR IGNORE INTO campuses(name) VALUES (?)", ["Vertiz"])
+
+        row = fetch_one(client, "SELECT id FROM campuses WHERE name = ?", ["Vertiz"])
+        if row:
+            campus_id = int(row[0])
+            for room_code in ROOMS_BY_CAMPUS.get("Vertiz", []):
+                client.execute(
+                    "INSERT OR IGNORE INTO rooms(campus_id, room_code) VALUES (?, ?)",
+                    [campus_id, room_code],
+                )
+
+        settings_set(client, "seed_done_v4_vertiz", "1")
 
 
 # =========================
@@ -790,7 +812,7 @@ with tab_rooms:
         reg_rooms = fetch_all(
             CLIENT,
             """
-            SELECT r.room_code
+            SELECT r.room_code, i.guard_name, i.inspected_at
             FROM inspections i
             JOIN rooms r ON r.id = i.room_id
             WHERE i.campus_id = ? AND i.inspected_on = ?
@@ -798,7 +820,7 @@ with tab_rooms:
             """,
             [campus_id_v, inspected_on_str],
         )
-        registered_list = [r[0] for r in reg_rooms] if reg_rooms else []
+        registered_list = reg_rooms if reg_rooms else []
 
         c1, c2 = st.columns([1, 2])
         with c1:
@@ -813,12 +835,26 @@ with tab_rooms:
             # Grid visual en recuadros
             cols_per_row = 4
             cols = st.columns(cols_per_row)
-            for i, room_code in enumerate(registered_list):
+            for i, (room_code, guard_name, inspected_at) in enumerate(registered_list):
+                hora = ""
+                try:
+                    if inspected_at:
+                        hora = str(inspected_at)[11:16]  # "HH:MM"
+                except Exception:
+                    hora = ""
+
                 with cols[i % cols_per_row]:
                     with st.container(border=True):
                         st.markdown(
-                            f"<div style='text-align:center; font-size:18px; font-weight:700; padding:6px 0;'>"
-                            f"{room_code}</div>",
+                            f"""
+                            <div style='text-align:center; font-size:18px; font-weight:700; padding:6px 0;'>
+                                {room_code}
+                            </div>
+                            <div style='text-align:center; font-size:12px; padding-bottom:6px;'>
+                                👮 {guard_name or "-"}<br/>
+                                🕒 {hora or (inspected_at or "-")}
+                            </div>
+                            """,
                             unsafe_allow_html=True,
                         )
 
@@ -846,7 +882,27 @@ with tab_new:
 
         rooms = get_rooms_for_campus(campus_id)
         room_map = {r[1]: int(r[0]) for r in rooms}
-        room_options = ["(Selecciona...)"] + list(room_map.keys()) + ["(Agregar nuevo...)"]
+
+        # --- Salones ya registrados hoy (para bloquearlos en selector) ---
+        already = fetch_all(
+            CLIENT,
+            """
+            SELECT r.room_code
+            FROM inspections i
+            JOIN rooms r ON r.id = i.room_id
+            WHERE i.campus_id = ? AND i.inspected_on = ?
+            """,
+            [campus_id, inspected_on_str],
+        )
+        already_set = set([x[0] for x in already]) if already else set()
+
+        available_rooms = [rc for rc in room_map.keys() if rc not in already_set]
+        room_options = ["(Selecciona...)"] + available_rooms + ["(Agregar nuevo...)"]
+
+        if already_set:
+            st.info("✅ Ya registrados hoy (bloqueados en el selector): " + ", ".join(sorted(already_set)))
+        if not available_rooms:
+            st.warning("⚠️ Todos los salones/áreas de este plantel ya quedaron registrados hoy. Solo puedes agregar uno nuevo.")
 
         cA, cB, cC = st.columns(3)
         with cA:
