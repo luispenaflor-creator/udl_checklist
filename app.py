@@ -47,6 +47,9 @@ HIDDEN_ASSETS = {
     "Conector HDMI en el pedestal",
 }
 
+# =========================
+# SALONES POR CAMPUS
+# =========================
 ROOMS_BY_CAMPUS = {
     "Luis Cabrera": [f"Salon {i:02d}" for i in range(1, 25)] + ["Lab PA", "Lab PB"],
     "Insurgentes": [f"Salon {i:02d}" for i in range(1, 24)] + ["Lab Computo"],
@@ -70,8 +73,19 @@ ROOMS_BY_CAMPUS = {
         + [f"Cocina {i}" for i in range(1, 9)]
         + ["Maridaje", "Laboratorio de redes", "Laboratorio 4", "Laboratorio 5", "Laboratorio de Psicologia"]
     ),
-    "Medellin": [],
+
+    # 🔥 AQUI YA VA MEDELLÍN CON TUS SALONES NUEVOS
+    "Medellin": [
+        "SALON NARANJA",
+        "SALON ACQUA",
+        "SALON OCRE",
+        "SALON ROSA",
+        "SALON AMARILLO",
+        "SALON VERDE",
+        "SALON MORADO",
+    ],
 }
+
 
 # =========================
 # ESTATUS (UI) + MAPEOS A DB
@@ -121,8 +135,6 @@ def db_to_ui_status(db_status: str) -> str:
     ):
         return "DAÑADO / NO FUNCIONA"
     return "DAÑADO / NO FUNCIONA"
-
-
 # =========================
 # SECRETS/ENV
 # =========================
@@ -407,7 +419,20 @@ def ensure_db_setup(client):
 
         settings_set(client, "seed_done_v4_vertiz", "1")
 
+    # ✅✅✅ Migración: agregar salones de Medellin aunque seed_done_v3 ya exista
+    if settings_get(client, "seed_done_v5_medellin") != "1":
+        client.execute("INSERT OR IGNORE INTO campuses(name) VALUES (?)", ["Medellin"])
 
+        row = fetch_one(client, "SELECT id FROM campuses WHERE name = ?", ["Medellin"])
+        if row:
+            campus_id = int(row[0])
+            for room_code in ROOMS_BY_CAMPUS.get("Medellin", []):
+                client.execute(
+                    "INSERT OR IGNORE INTO rooms(campus_id, room_code) VALUES (?, ?)",
+                    [campus_id, room_code],
+                )
+
+        settings_set(client, "seed_done_v5_medellin", "1")
 # =========================
 # USERS
 # =========================
@@ -832,14 +857,13 @@ with tab_rooms:
             st.info("Aún no hay salones registrados hoy en este plantel.")
         else:
             st.markdown("### Lista de salones/áreas (registrados)")
-            # Grid visual en recuadros
             cols_per_row = 4
             cols = st.columns(cols_per_row)
             for i, (room_code, guard_name, inspected_at) in enumerate(registered_list):
                 hora = ""
                 try:
                     if inspected_at:
-                        hora = str(inspected_at)[11:16]  # "HH:MM"
+                        hora = str(inspected_at)[11:16]
                 except Exception:
                     hora = ""
 
@@ -883,7 +907,6 @@ with tab_new:
         rooms = get_rooms_for_campus(campus_id)
         room_map = {r[1]: int(r[0]) for r in rooms}
 
-        # --- Salones ya registrados hoy (para bloquearlos en selector) ---
         already = fetch_all(
             CLIENT,
             """
@@ -1104,7 +1127,6 @@ if is_logged():
             room_codes = [r[1] for r in rooms]
             room_q = st.selectbox("Salón / Área", ["(Todos)"] + room_codes, index=0, key="room_q")
 
-        # activos visibles
         asset_rows = cached_assets()
         asset_names = [r[1] for r in asset_rows]
         activo_q = st.multiselect(
