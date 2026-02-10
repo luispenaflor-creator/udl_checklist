@@ -902,7 +902,7 @@ with tab_new:
     else:
         campus_id = cached_campus_id(campus)
         today_mx = datetime.now(TZ_MX).date()
-        inspected_on_str = today_mx.strftime("%Y-%m-%d")
+        inspected_on_str = today_mx.strftime("%d-%m-%Y")
 
         rooms = get_rooms_for_campus(campus_id)
         room_map = {r[1]: int(r[0]) for r in rooms}
@@ -1547,4 +1547,5 @@ if is_logged():
                                 st.rerun()
                         except Exception as e:
                             st.error(f"No se pudo resetear: {e}")
+
 
