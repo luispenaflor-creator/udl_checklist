@@ -274,13 +274,13 @@ def fetch_all(client, sql, args=None):
     import os
     DEBUG_SQL = os.getenv("DEBUG_SQL", "0") == "1"
 
-if DEBUG_SQL:
-    import streamlit as st
-    st.code(sql, language="sql")
-    st.write("ARGS:", args or [])
+    if DEBUG_SQL:
+        import streamlit as st
+        st.code(sql, language="sql")
+        st.write("ARGS:", args or [])
     
-res = client.execute(sql, args or [])
-return res["rows"]
+    res = client.execute(sql, args or [])
+    return res["rows"]
 
 
 # =========================
@@ -1555,6 +1555,7 @@ if is_logged():
                                 st.rerun()
                         except Exception as e:
                             st.error(f"No se pudo resetear: {e}")
+
 
 
 
