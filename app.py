@@ -272,7 +272,7 @@ def fetch_one(client, sql, args=None):
 
 def fetch_all(client, sql, args=None):
     import os
-DEBUG_SQL = os.getenv("DEBUG_SQL", "0") == "1"
+    DEBUG_SQL = os.getenv("DEBUG_SQL", "0") == "1"
 
 if DEBUG_SQL:
     import streamlit as st
@@ -1554,6 +1554,7 @@ if is_logged():
                                 st.rerun()
                         except Exception as e:
                             st.error(f"No se pudo resetear: {e}")
+
 
 
 
