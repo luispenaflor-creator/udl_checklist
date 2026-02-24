@@ -278,6 +278,7 @@ if DEBUG_SQL:
     import streamlit as st
     st.code(sql, language="sql")
     st.write("ARGS:", args or [])
+    
     res = client.execute(sql, args or [])
     return res["rows"]
 
@@ -1554,6 +1555,7 @@ if is_logged():
                                 st.rerun()
                         except Exception as e:
                             st.error(f"No se pudo resetear: {e}")
+
 
 
 
