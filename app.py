@@ -1555,11 +1555,21 @@ if is_logged():
                 JOIN campuses c ON c.id = i.campus_id
                 JOIN rooms r ON r.id = i.room_id
                 WHERE {where_sql}
+                  AND EXISTS (
+                    SELECT 1
+                    FROM inspection_items it
+                    JOIN asset_types a ON a.id = it.asset_type_id
+                    WHERE it.inspection_id = i.id
+                      AND a.name NOT IN ({ph_hidden})
+                      {status_sql}
+                      {asset_sql}
+                  )
                 ORDER BY date({INS_ISO}) DESC, c.name, r.room_code
                 LIMIT 300
                 """,
-                args,
+                args + hidden + status_args + asset_args,
             )
+
 
             st.write(f"Resultados: **{len(rows)}**")
             if not rows:
