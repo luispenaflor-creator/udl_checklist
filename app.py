@@ -456,6 +456,9 @@ def ensure_db_setup(client):
                         room_code IN ('Laboratorio 1','Redes')
                         OR (room_code LIKE 'Salon %' AND CAST(substr(room_code, 7) AS INTEGER) >= 25)
                       )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM inspections i WHERE i.room_id = rooms.id
+                  )
                 """,
                 [campus_id],
             )
