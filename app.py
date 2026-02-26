@@ -447,13 +447,13 @@ if settings_get(client, "cleanup_luis_cabrera_rooms_v1") != "1":
     row = fetch_one(client, "SELECT id FROM campuses WHERE name = ?", ["Luis Cabrera"])
     if row:
         campus_id = int(row[0])
-        # Elimina Lab PA/Lab PB (históricos), 'Laboratorio 1', 'Redes' y salones 25+
+        # Limpieza Luis Cabrera: elimina 'Laboratorio 1', 'Redes' y salones 25+ (conserva Lab PA/Lab PB)
         client.execute(
             """
             DELETE FROM rooms
             WHERE campus_id = ?
               AND (
-                    room_code IN ('Lab PA','Lab PB','Laboratorio 1','Redes')
+                    room_code IN ('Laboratorio 1','Redes')
                     OR (room_code LIKE 'Salon %' AND CAST(substr(room_code, 7) AS INTEGER) >= 25)
                   )
             """,
@@ -1237,7 +1237,7 @@ if is_logged():
         # Construye WHERE (robusto)
         # inspected_on está guardado como dd-mm-YYYY, lo convertimos a ISO para comparar fechas.
         # -----------------------------
-        INS_ISO = "substr(i.inspected_on,7,4)||'-'||substr(i.inspected_on,4,2)||'-'||substr(i.inspected_on,1,2)"
+        INS_ISO = "CASE WHEN substr(i.inspected_on,5,1)='-' THEN i.inspected_on ELSE substr(i.inspected_on,7,4)||'-'||substr(i.inspected_on,4,2)||'-'||substr(i.inspected_on,1,2) END"
         where = [f"date({INS_ISO}) BETWEEN date(?) AND date(?)"]
         args = [qf["from_d"].strftime("%Y-%m-%d"), qf["to_d"].strftime("%Y-%m-%d")]
 
