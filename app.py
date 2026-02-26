@@ -443,8 +443,8 @@ def ensure_db_setup(client):
         settings_set(client, "seed_done_v5_medellin", "1")
 
 # 🧹 Limpieza: quitar salones no deseados de Luis Cabrera (histórico)
-if settings_get(client, "cleanup_luis_cabrera_rooms_v1") != "1":
-    row = fetch_one(client, "SELECT id FROM campuses WHERE name = ?", ["Luis Cabrera"])
+if settings_get(CLIENT, "cleanup_luis_cabrera_rooms_v1") != "1":
+    row = fetch_one(CLIENT, "SELECT id FROM campuses WHERE name = ?", ["Luis Cabrera"])
     if row:
         campus_id = int(row[0])
         # Limpieza Luis Cabrera: elimina 'Laboratorio 1', 'Redes' y salones 25+ (conserva Lab PA/Lab PB)
@@ -459,7 +459,7 @@ if settings_get(client, "cleanup_luis_cabrera_rooms_v1") != "1":
             """,
             [campus_id],
         )
-    settings_set(client, "cleanup_luis_cabrera_rooms_v1", "1")
+    settings_set(CLIENT, "cleanup_luis_cabrera_rooms_v1", "1")
 # =========================
 # USERS
 # =========================
